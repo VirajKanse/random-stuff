@@ -1,0 +1,2952 @@
+From d5c94fcb8c478f2b089c24f8c81d0a9ba4a6d290 Mon Sep 17 00:00:00 2001
+From: DennySPB <dennyspb@gmail.com>
+Date: Wed, 16 Oct 2019 16:00:41 +0300
+Subject: [PATCH] [SQUASH] BoostFramework: To Enhance performance.
+
+DennySPb: thx CAF for pulling owl on the globe
+
+this is squash of the following commits:
+
+BoostFramework: To Enhance performance.
+framework/base: add parallel verifyV1
+Add perf hint for rotation latency
+Add perf hint for screen rotation animation
+IOP/UXE: This change is to enable the IOP and UXE
+BoostFramework: Move property checks to pass sepolicy
+IOP : Adding support for UXPerf Class
+BoostFramework: Clean up code
+Performance: Activity Trigger frameworks support
+Removed activity trigger whitelist related support
+Disable swipe boost and preferred apps for certain cases
+Revert "IOP/UXE: This change is to enable the IOP and UXE"
+Revert "IOP : Adding support for UXPerf Class"
+Add Game boost & modify launchboostv2 invocation.
+Add perfGetFeedback api support from framework
+Modify game detection logic
+IOP/UXE: This change is related to IOP and UXE Feature.
+Support the perflock request from system/priv apps whose domain are untrusted
+Disable swipe boost and preferred apps for certain cases
+framework: Adding support for perf get prop in Boostframework
+BoostFramework : Modified Start Proc trigger and added Kill Hint.
+Boostframework: Adding reserved hint types for launch boost
+Moving property to iop hal
+Add perf hint for performance mode
+Add start support for Activity Trigger
+Perf: Change for AGPE
+perf: Convert Horizontal Scroll to GestureFlingBoost.
+...and some other up to LA.UM.8.3.r1-06100-sdm845.0 CAF tag
+
+Change-Id: I8811ce5fa3428358bcb540d7d48fa6601e064e70
+Signed-off-by: DennySPB <dennyspb@gmail.com>
+---
+ .../android/app/ActivityManagerInternal.java  |   3 +
+ core/java/android/app/ActivityThread.java     |  43 +-
+ .../android/content/pm/ApplicationInfo.java   |  28 ++
+ .../content/res/CompatibilityInfo.java        |  37 +-
+ core/java/android/util/BoostFramework.java    | 415 ++++++++++++++++++
+ .../util/apk/ApkSignatureVerifier.java        |  23 +-
+ .../android/internal/app/ActivityTrigger.java | 100 +++++
+ core/jni/Android.bp                           |   1 +
+ core/jni/AndroidRuntime.cpp                   |   2 +
+ ...m_android_internal_app_ActivityTrigger.cpp | 235 ++++++++++
+ .../systemui/statusbar/phone/PanelView.java   |  13 +
+ .../com/android/server/am/ActiveServices.java |  78 +++-
+ .../server/am/ActivityManagerConstants.java   |  51 ++-
+ .../server/am/ActivityManagerService.java     |  84 +++-
+ .../com/android/server/am/OomAdjuster.java    |  57 +++
+ .../com/android/server/am/ProcessList.java    |  13 +
+ .../com/android/server/am/ProcessRecord.java  |   8 +
+ .../android/server/wm/ActivityDisplay.java    |  55 +++
+ .../server/wm/ActivityMetricsLogger.java      |  21 +
+ .../com/android/server/wm/ActivityRecord.java |  26 +-
+ .../com/android/server/wm/ActivityStack.java  |  42 +-
+ .../server/wm/ActivityStackSupervisor.java    |  97 +++-
+ .../android/server/wm/ActivityStarter.java    |  16 +
+ .../server/wm/ActivityTaskManagerService.java |   2 +-
+ .../com/android/server/wm/DisplayPolicy.java  | 110 +++++
+ .../com/android/server/wm/RecentTasks.java    |   9 +
+ .../server/wm/RootActivityContainer.java      |   4 +-
+ .../server/wm/ScreenRotationAnimation.java    |  13 +
+ .../SystemGesturesPointerEventListener.java   |  22 +
+ .../wm/TaskTapPointerEventListener.java       |  27 ++
+ .../server/wm/WindowManagerService.java       |  26 +-
+ 31 files changed, 1633 insertions(+), 28 deletions(-)
+ create mode 100644 core/java/android/util/BoostFramework.java
+ create mode 100644 core/java/com/android/internal/app/ActivityTrigger.java
+ create mode 100644 core/jni/com_android_internal_app_ActivityTrigger.cpp
+
+diff --git a/core/java/android/app/ActivityManagerInternal.java b/core/java/android/app/ActivityManagerInternal.java
+index a30238ac9e3..79eee1428ca 100644
+--- a/core/java/android/app/ActivityManagerInternal.java
++++ b/core/java/android/app/ActivityManagerInternal.java
+@@ -347,4 +347,7 @@ public abstract class ActivityManagerInternal {
+ 
+     /** Returns true if the given UID is registered as an active instrumentation. */
+     public abstract boolean isActiveInstrumentation(int uid);
++
++    // Starts a process as empty.
++    public abstract int startActivityAsUserEmpty(Bundle options);
+ }
+diff --git a/core/java/android/app/ActivityThread.java b/core/java/android/app/ActivityThread.java
+index 2d125f97545..7ccf57b05ea 100644
+--- a/core/java/android/app/ActivityThread.java
++++ b/core/java/android/app/ActivityThread.java
+@@ -129,6 +129,7 @@ import android.system.OsConstants;
+ import android.system.StructStat;
+ import android.util.AndroidRuntimeException;
+ import android.util.ArrayMap;
++import android.util.BoostFramework;
+ import android.util.DisplayMetrics;
+ import android.util.EventLog;
+ import android.util.Log;
+@@ -6125,6 +6126,8 @@ public final class ActivityThread extends ClientTransactionHandler {
+ 
+     @UnsupportedAppUsage
+     private void handleBindApplication(AppBindData data) {
++        long st_bindApp = SystemClock.uptimeMillis();
++        BoostFramework ux_perf = null;
+         // Register the UI Thread as a sensitive thread to the runtime.
+         VMRuntime.registerSensitiveThread();
+         // In the case the stack depth property exists, pass it down to the runtime.
+@@ -6226,10 +6229,17 @@ public final class ActivityThread extends ClientTransactionHandler {
+         /**
+          * Switch this process to density compatibility mode if needed.
+          */
+-        if ((data.appInfo.flags&ApplicationInfo.FLAG_SUPPORTS_SCREEN_DENSITIES)
++        if ((data.appInfo.flags & ApplicationInfo.FLAG_SUPPORTS_SCREEN_DENSITIES)
+                 == 0) {
+             mDensityCompatMode = true;
+             Bitmap.setDefaultDensity(DisplayMetrics.DENSITY_DEFAULT);
++        } else {
++            int overrideDensity = data.appInfo.getOverrideDensity();
++            if(overrideDensity != 0) {
++                Log.d(TAG, "override app density from " + DisplayMetrics.DENSITY_DEVICE + " to " + overrideDensity);
++                mDensityCompatMode = true;
++                Bitmap.setDefaultDensity(overrideDensity);
++            }
+         }
+         updateDefaultDensity();
+ 
+@@ -6349,6 +6359,15 @@ public final class ActivityThread extends ClientTransactionHandler {
+         updateLocaleListFromAppContext(appContext,
+                 mResourcesManager.getConfiguration().getLocales());
+ 
++        if (!Process.isIsolated()) {
++            final int old_mask = StrictMode.allowThreadDiskWritesMask();
++            try {
++                ux_perf = new BoostFramework(appContext);
++            } finally {
++                 StrictMode.setThreadPolicyMask(old_mask);
++            }
++        }
++
+         if (!Process.isIsolated()) {
+             final int oldMask = StrictMode.allowThreadDiskWritesMask();
+             try {
+@@ -6499,6 +6518,28 @@ public final class ActivityThread extends ClientTransactionHandler {
+                 throw e.rethrowFromSystemServer();
+             }
+         }
++        long end_bindApp = SystemClock.uptimeMillis();
++        int bindApp_dur = (int) (end_bindApp - st_bindApp);
++        String pkg_name = null;
++        if (appContext != null) {
++            pkg_name = appContext.getPackageName();
++        }
++        if (ux_perf != null && !Process.isIsolated() && pkg_name != null) {
++            String pkgDir = null;
++            try
++            {
++                String codePath = appContext.getPackageCodePath();
++                pkgDir =  codePath.substring(0, codePath.lastIndexOf('/'));
++            }
++            catch(Exception e)
++            {
++                Slog.e(TAG, "HeavyGameThread () : Exception_1 = " + e);
++            }
++            ux_perf.perfUXEngine_events(BoostFramework.UXE_EVENT_BINDAPP, 0,
++                                           pkg_name,
++                                           bindApp_dur,
++                                           pkgDir);
++        }
+     }
+ 
+     /*package*/ final void finishInstrumentation(int resultCode, Bundle results) {
+diff --git a/core/java/android/content/pm/ApplicationInfo.java b/core/java/android/content/pm/ApplicationInfo.java
+index 9bc5f805561..3727975af3a 100644
+--- a/core/java/android/content/pm/ApplicationInfo.java
++++ b/core/java/android/content/pm/ApplicationInfo.java
+@@ -29,6 +29,8 @@ import android.content.res.Resources;
+ import android.graphics.drawable.Drawable;
+ import android.os.Build;
+ import android.os.Environment;
++import android.os.SystemProperties;
++import android.util.DisplayMetrics;
+ import android.os.Parcel;
+ import android.os.Parcelable;
+ import android.os.UserHandle;
+@@ -741,6 +743,19 @@ public class ApplicationInfo extends PackageItemInfo implements Parcelable {
+      */
+     public static final String METADATA_PRELOADED_FONTS = "preloaded_fonts";
+ 
++    /**
++     * Boolean indicating whether the resolution of the SurfaceView associated
++     * with this appplication can be overriden.
++     * {@hide}
++     */
++    public int overrideRes = 0;
++
++    /**
++     * In case, app needs different density than device density, set this value.
++     * {@hide}
++     */
++    public int overrideDensity = 0;
++
+     /**
+      * The required smallest screen width the application can run on.  If 0,
+      * nothing has been specified.  Comes from
+@@ -1546,6 +1561,8 @@ public class ApplicationInfo extends PackageItemInfo implements Parcelable {
+         theme = orig.theme;
+         flags = orig.flags;
+         privateFlags = orig.privateFlags;
++        overrideRes = orig.overrideRes;
++        overrideDensity = orig.overrideDensity;
+         requiresSmallestWidthDp = orig.requiresSmallestWidthDp;
+         compatibleWidthLimitDp = orig.compatibleWidthLimitDp;
+         largestWidthLimitDp = orig.largestWidthLimitDp;
+@@ -1620,6 +1637,8 @@ public class ApplicationInfo extends PackageItemInfo implements Parcelable {
+         dest.writeInt(theme);
+         dest.writeInt(flags);
+         dest.writeInt(privateFlags);
++        dest.writeInt(overrideRes);
++        dest.writeInt(overrideDensity);
+         dest.writeInt(requiresSmallestWidthDp);
+         dest.writeInt(compatibleWidthLimitDp);
+         dest.writeInt(largestWidthLimitDp);
+@@ -1699,6 +1718,8 @@ public class ApplicationInfo extends PackageItemInfo implements Parcelable {
+         theme = source.readInt();
+         flags = source.readInt();
+         privateFlags = source.readInt();
++        overrideRes = source.readInt();
++        overrideDensity = source.readInt();
+         requiresSmallestWidthDp = source.readInt();
+         compatibleWidthLimitDp = source.readInt();
+         largestWidthLimitDp = source.readInt();
+@@ -2116,12 +2137,18 @@ public class ApplicationInfo extends PackageItemInfo implements Parcelable {
+         return output.toArray(new String[output.size()]);
+     }
+ 
++    /** @hide */
++    public int getOverrideDensity() {
++        return overrideDensity;
++    }
++
+     /** {@hide} */ public void setCodePath(String codePath) { scanSourceDir = codePath; }
+     /** {@hide} */ public void setBaseCodePath(String baseCodePath) { sourceDir = baseCodePath; }
+     /** {@hide} */ public void setSplitCodePaths(String[] splitCodePaths) { splitSourceDirs = splitCodePaths; }
+     /** {@hide} */ public void setResourcePath(String resourcePath) { scanPublicSourceDir = resourcePath; }
+     /** {@hide} */ public void setBaseResourcePath(String baseResourcePath) { publicSourceDir = baseResourcePath; }
+     /** {@hide} */ public void setSplitResourcePaths(String[] splitResourcePaths) { splitPublicSourceDirs = splitResourcePaths; }
++    /** {@hide} */ public void setOverrideRes(int overrideResolution) { overrideRes = overrideResolution; }
+ 
+     /** {@hide} */
+     @UnsupportedAppUsage
+@@ -2133,4 +2160,5 @@ public class ApplicationInfo extends PackageItemInfo implements Parcelable {
+     @UnsupportedAppUsage
+     public String getBaseResourcePath() { return publicSourceDir; }
+     /** {@hide} */ public String[] getSplitResourcePaths() { return splitPublicSourceDirs; }
++    /** {@hide} */ public int canOverrideRes() { return overrideRes; }
+ }
+diff --git a/core/java/android/content/res/CompatibilityInfo.java b/core/java/android/content/res/CompatibilityInfo.java
+index a99a0b5a7a9..27a09bf91f3 100644
+--- a/core/java/android/content/res/CompatibilityInfo.java
++++ b/core/java/android/content/res/CompatibilityInfo.java
+@@ -30,6 +30,7 @@ import android.util.DisplayMetrics;
+ import android.view.MotionEvent;
+ import android.view.WindowManager;
+ import android.view.WindowManager.LayoutParams;
++import android.util.Log;
+ 
+ /**
+  * CompatibilityInfo class keeps the information about compatibility mode that the application is
+@@ -43,6 +44,8 @@ public class CompatibilityInfo implements Parcelable {
+     public static final CompatibilityInfo DEFAULT_COMPATIBILITY_INFO = new CompatibilityInfo() {
+     };
+ 
++    static final String TAG = "CompatibilityInfo";
++
+     /**
+      * This is the number of pixels we would like to have along the
+      * short axis of an app that needs to run on a normal size screen.
+@@ -59,7 +62,7 @@ public class CompatibilityInfo implements Parcelable {
+      *  A compatibility flags
+      */
+     private final int mCompatibilityFlags;
+-    
++
+     /**
+      * A flag mask to tell if the application needs scaling (when mApplicationScale != 1.0f)
+      * {@see compatibilityFlag}
+@@ -149,10 +152,18 @@ public class CompatibilityInfo implements Parcelable {
+                 compatFlags |= NEEDS_SCREEN_COMPAT;
+             }
+ 
+-            // Modern apps always support densities.
+-            applicationDensity = DisplayMetrics.DENSITY_DEVICE;
+-            applicationScale = 1.0f;
+-            applicationInvertedScale = 1.0f;
++            int density = appInfo.getOverrideDensity();
++            if(density != 0) {
++                applicationDensity = density;
++                applicationScale = DisplayMetrics.DENSITY_DEVICE  / (float) applicationDensity;
++                applicationInvertedScale = 1.0f / applicationScale;
++                compatFlags |= SCALING_REQUIRED;
++            } else {
++                // Modern apps always support densities.
++                applicationDensity = DisplayMetrics.DENSITY_DEVICE;
++                applicationScale = 1.0f;
++                applicationInvertedScale = 1.0f;
++            }
+ 
+         } else {
+             /**
+@@ -239,16 +250,22 @@ public class CompatibilityInfo implements Parcelable {
+                 compatFlags |= NEVER_NEEDS_COMPAT;
+             }
+ 
+-            if ((appInfo.flags & ApplicationInfo.FLAG_SUPPORTS_SCREEN_DENSITIES) != 0) {
+-                applicationDensity = DisplayMetrics.DENSITY_DEVICE;
+-                applicationScale = 1.0f;
+-                applicationInvertedScale = 1.0f;
+-            } else {
++            int density = appInfo.getOverrideDensity();
++            if ((appInfo.flags & ApplicationInfo.FLAG_SUPPORTS_SCREEN_DENSITIES) == 0) {
+                 applicationDensity = DisplayMetrics.DENSITY_DEFAULT;
+                 applicationScale = DisplayMetrics.DENSITY_DEVICE
+                         / (float) DisplayMetrics.DENSITY_DEFAULT;
+                 applicationInvertedScale = 1.0f / applicationScale;
+                 compatFlags |= SCALING_REQUIRED;
++            } else if(density != 0) {
++                applicationDensity = density;
++                applicationScale = DisplayMetrics.DENSITY_DEVICE / (float) applicationDensity;
++                applicationInvertedScale = 1.0f / applicationScale;
++                compatFlags |= SCALING_REQUIRED;
++            } else {
++                applicationDensity = DisplayMetrics.DENSITY_DEVICE;
++                applicationScale = 1.0f;
++                applicationInvertedScale = 1.0f;
+             }
+         }
+ 
+diff --git a/core/java/android/util/BoostFramework.java b/core/java/android/util/BoostFramework.java
+new file mode 100644
+index 00000000000..594a17aacf1
+--- /dev/null
++++ b/core/java/android/util/BoostFramework.java
+@@ -0,0 +1,415 @@
++/*
++ * Copyright (c) 2017-2018, The Linux Foundation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *    * Redistributions of source code must retain the above copyright
++ *      notice, this list of conditions and the following disclaimer.
++ *    * Redistributions in binary form must reproduce the above
++ *      copyright notice, this list of conditions and the following
++ *      disclaimer in the documentation and/or other materials provided
++ *      with the distribution.
++ *    * Neither the name of The Linux Foundation nor the names of its
++ *      contributors may be used to endorse or promote products derived
++ *      from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
++ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
++ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++package android.util;
++
++import android.content.Context;
++import android.util.Log;
++
++import java.lang.reflect.Constructor;
++import java.lang.reflect.Method;
++
++/** @hide */
++public class BoostFramework {
++
++    private static final String TAG = "BoostFramework";
++    private static final String PERFORMANCE_JAR = "/system/framework/QPerformance.jar";
++    private static final String PERFORMANCE_CLASS = "com.qualcomm.qti.Performance";
++
++    private static final String UXPERFORMANCE_JAR = "/system/framework/UxPerformance.jar";
++    private static final String UXPERFORMANCE_CLASS = "com.qualcomm.qti.UxPerformance";
++
++/** @hide */
++    private static boolean sIsLoaded = false;
++    private static Class<?> sPerfClass = null;
++    private static Method sAcquireFunc = null;
++    private static Method sPerfHintFunc = null;
++    private static Method sReleaseFunc = null;
++    private static Method sReleaseHandlerFunc = null;
++    private static Method sFeedbackFunc = null;
++    private static Method sPerfGetPropFunc = null;
++
++    private static Method sIOPStart = null;
++    private static Method sIOPStop  = null;
++    private static Method sUXEngineEvents  = null;
++    private static Method sUXEngineTrigger  = null;
++
++    private static boolean sUxIsLoaded = false;
++    private static Class<?> sUxPerfClass = null;
++    private static Method sUxIOPStart = null;
++
++/** @hide */
++    private Object mPerf = null;
++    private Object mUxPerf = null;
++
++    //perf hints
++    public static final int VENDOR_HINT_SCROLL_BOOST = 0x00001080;
++    public static final int VENDOR_HINT_FIRST_LAUNCH_BOOST = 0x00001081;
++    public static final int VENDOR_HINT_SUBSEQ_LAUNCH_BOOST = 0x00001082;
++    public static final int VENDOR_HINT_ANIM_BOOST = 0x00001083;
++    public static final int VENDOR_HINT_ACTIVITY_BOOST = 0x00001084;
++    public static final int VENDOR_HINT_TOUCH_BOOST = 0x00001085;
++    public static final int VENDOR_HINT_MTP_BOOST = 0x00001086;
++    public static final int VENDOR_HINT_DRAG_BOOST = 0x00001087;
++    public static final int VENDOR_HINT_PACKAGE_INSTALL_BOOST = 0x00001088;
++    public static final int VENDOR_HINT_ROTATION_LATENCY_BOOST = 0x00001089;
++    public static final int VENDOR_HINT_ROTATION_ANIM_BOOST = 0x00001090;
++    public static final int VENDOR_HINT_PERFORMANCE_MODE = 0x00001091;
++    public static final int VENDOR_HINT_APP_UPDATE = 0x00001092;
++    public static final int VENDOR_HINT_KILL = 0x00001093;
++    //perf events
++    public static final int VENDOR_HINT_FIRST_DRAW = 0x00001042;
++    public static final int VENDOR_HINT_TAP_EVENT = 0x00001043;
++    //feedback hints
++    public static final int VENDOR_FEEDBACK_WORKLOAD_TYPE = 0x00001601;
++    public static final int VENDOR_FEEDBACK_LAUNCH_END_POINT = 0x00001602;
++
++    //UXE Events and Triggers
++    public static final int UXE_TRIGGER = 1;
++    public static final int UXE_EVENT_BINDAPP = 2;
++    public static final int UXE_EVENT_DISPLAYED_ACT = 3;
++    public static final int UXE_EVENT_KILL = 4;
++    public static final int UXE_EVENT_GAME  = 5;
++    public static final int UXE_EVENT_SUB_LAUNCH = 6;
++    public static final int UXE_EVENT_PKG_UNINSTALL = 7;
++    public static final int UXE_EVENT_PKG_INSTALL = 8;
++
++    public class Scroll {
++        public static final int VERTICAL = 1;
++        public static final int HORIZONTAL = 2;
++        public static final int PANEL_VIEW = 3;
++        public static final int PREFILING = 4;
++    };
++
++    public class Launch {
++        public static final int BOOST_V1 = 1;
++        public static final int BOOST_V2 = 2;
++        public static final int BOOST_V3 = 3;
++        public static final int BOOST_GAME = 4;
++        public static final int RESERVED_1 = 5;
++        public static final int RESERVED_2 = 6;
++        public static final int TYPE_SERVICE_START = 100;
++        public static final int TYPE_START_PROC = 101;
++    };
++
++    public class Draw {
++        public static final int EVENT_TYPE_V1 = 1;
++    };
++
++    public class WorkloadType {
++        public static final int NOT_KNOWN = 0;
++        public static final int APP = 1;
++        public static final int GAME = 2;
++        public static final int BROWSER = 3;
++        public static final int PREPROAPP = 4;
++    };
++
++/** @hide */
++    public BoostFramework() {
++        initFunctions();
++
++        try {
++            if (sPerfClass != null) {
++                mPerf = sPerfClass.newInstance();
++            }
++            if (sUxPerfClass != null) {
++                mUxPerf = sUxPerfClass.newInstance();
++            }
++        }
++        catch(Exception e) {
++            Log.e(TAG,"BoostFramework() : Exception_2 = " + e);
++        }
++    }
++
++/** @hide */
++    public BoostFramework(Context context) {
++        initFunctions();
++
++        try {
++            if (sPerfClass != null) {
++                Constructor cons = sPerfClass.getConstructor(Context.class);
++                if (cons != null)
++                    mPerf = cons.newInstance(context);
++            }
++            if (sUxPerfClass != null) {
++                mUxPerf = sUxPerfClass.newInstance();
++            }
++        }
++        catch(Exception e) {
++            Log.e(TAG,"BoostFramework() : Exception_3 = " + e);
++        }
++    }
++
++/** @hide */
++    public BoostFramework(boolean isUntrustedDomain) {
++        initFunctions();
++
++        try {
++            if (sPerfClass != null) {
++                Constructor cons = sPerfClass.getConstructor(boolean.class);
++                if (cons != null)
++                    mPerf = cons.newInstance(isUntrustedDomain);
++            }
++            if (sUxPerfClass != null) {
++                mUxPerf = sUxPerfClass.newInstance();
++            }
++        }
++        catch(Exception e) {
++            Log.e(TAG,"BoostFramework() : Exception_5 = " + e);
++        }
++    }
++
++    private void initFunctions () {
++        synchronized(BoostFramework.class) {
++            if (sIsLoaded == false) {
++                try {
++                    sPerfClass = Class.forName(PERFORMANCE_CLASS);
++
++                    Class[] argClasses = new Class[] {int.class, int[].class};
++                    sAcquireFunc = sPerfClass.getMethod("perfLockAcquire", argClasses);
++
++                    argClasses = new Class[] {int.class, String.class, int.class, int.class};
++                    sPerfHintFunc = sPerfClass.getMethod("perfHint", argClasses);
++
++                    argClasses = new Class[] {};
++                    sReleaseFunc = sPerfClass.getMethod("perfLockRelease", argClasses);
++
++                    argClasses = new Class[] {int.class};
++                    sReleaseHandlerFunc = sPerfClass.getDeclaredMethod("perfLockReleaseHandler", argClasses);
++
++                    argClasses = new Class[] {int.class, String.class};
++                    sFeedbackFunc = sPerfClass.getMethod("perfGetFeedback", argClasses);
++
++                    argClasses = new Class[] {int.class, String.class, String.class};
++                    sIOPStart =   sPerfClass.getDeclaredMethod("perfIOPrefetchStart", argClasses);
++
++                    argClasses = new Class[] {};
++                    sIOPStop =  sPerfClass.getDeclaredMethod("perfIOPrefetchStop", argClasses);
++
++                    argClasses = new Class[] {String.class, String.class};
++                    sPerfGetPropFunc = sPerfClass.getMethod("perfGetProp", argClasses);
++
++                    try {
++                        argClasses = new Class[] {int.class, int.class, String.class, int.class, String.class};
++                        sUXEngineEvents =  sPerfClass.getDeclaredMethod("perfUXEngine_events",
++                                                                          argClasses);
++
++                        argClasses = new Class[] {int.class};
++                        sUXEngineTrigger =  sPerfClass.getDeclaredMethod("perfUXEngine_trigger",
++                                                                           argClasses);
++                    } catch (Exception e) {
++                        Log.i(TAG, "BoostFramework() : Exception_4 = PreferredApps not supported");
++                    }
++
++                    sIsLoaded = true;
++                }
++                catch(Exception e) {
++                    Log.e(TAG,"BoostFramework() : Exception_1 = " + e);
++                }
++                // Load UXE Class now Adding new try/catch block to avoid
++                // any interference with Qperformance
++                try {
++                    sUxPerfClass = Class.forName(UXPERFORMANCE_CLASS);
++
++                    Class[] argUxClasses = new Class[] {int.class, String.class, String.class};
++                    sUxIOPStart = sUxPerfClass.getDeclaredMethod("perfIOPrefetchStart", argUxClasses);
++
++                    sUxIsLoaded = true;
++                }
++                catch(Exception e) {
++                    Log.e(TAG,"BoostFramework() Ux Perf: Exception = " + e);
++                }
++            }
++        }
++    }
++
++/** @hide */
++    public int perfLockAcquire(int duration, int... list) {
++        int ret = -1;
++        try {
++            if (sAcquireFunc != null) {
++                Object retVal = sAcquireFunc.invoke(mPerf, duration, list);
++                ret = (int)retVal;
++            }
++        } catch(Exception e) {
++            Log.e(TAG,"Exception " + e);
++        }
++        return ret;
++    }
++
++/** @hide */
++    public int perfLockRelease() {
++        int ret = -1;
++        try {
++            if (sReleaseFunc != null) {
++                Object retVal = sReleaseFunc.invoke(mPerf);
++                ret = (int)retVal;
++            }
++        } catch(Exception e) {
++            Log.e(TAG,"Exception " + e);
++        }
++        return ret;
++    }
++
++/** @hide */
++    public int perfLockReleaseHandler(int handle) {
++        int ret = -1;
++        try {
++            if (sReleaseHandlerFunc != null) {
++                Object retVal = sReleaseHandlerFunc.invoke(mPerf, handle);
++                ret = (int)retVal;
++            }
++        } catch(Exception e) {
++            Log.e(TAG,"Exception " + e);
++        }
++        return ret;
++    }
++
++/** @hide */
++    public int perfHint(int hint, String userDataStr) {
++        return perfHint(hint, userDataStr, -1, -1);
++    }
++
++/** @hide */
++    public int perfHint(int hint, String userDataStr, int userData) {
++        return perfHint(hint, userDataStr, userData, -1);
++    }
++
++/** @hide */
++    public int perfHint(int hint, String userDataStr, int userData1, int userData2) {
++        int ret = -1;
++        try {
++            if (sPerfHintFunc != null) {
++                Object retVal = sPerfHintFunc.invoke(mPerf, hint, userDataStr, userData1, userData2);
++                ret = (int)retVal;
++            }
++        } catch(Exception e) {
++            Log.e(TAG,"Exception " + e);
++        }
++        return ret;
++    }
++
++/** @hide */
++    public int perfGetFeedback(int req, String userDataStr) {
++        int ret = -1;
++        try {
++            if (sFeedbackFunc != null) {
++                Object retVal = sFeedbackFunc.invoke(mPerf, req, userDataStr);
++                ret = (int)retVal;
++            }
++        } catch(Exception e) {
++            Log.e(TAG,"Exception " + e);
++        }
++        return ret;
++    }
++
++/** @hide */
++    public int perfIOPrefetchStart(int pid, String pkgName, String codePath) {
++        int ret = -1;
++        try {
++            Object retVal = sIOPStart.invoke(mPerf, pid, pkgName, codePath);
++            ret = (int) retVal;
++        } catch (Exception e) {
++            Log.e(TAG, "Exception " + e);
++        }
++        try {
++             Object retVal = sUxIOPStart.invoke(mUxPerf, pid, pkgName, codePath);
++             ret = (int) retVal;
++         } catch (Exception e) {
++             Log.e(TAG, "Ux Perf Exception " + e);
++         }
++
++        return ret;
++    }
++
++/** @hide */
++    public int perfIOPrefetchStop() {
++        int ret = -1;
++        try {
++            Object retVal = sIOPStop.invoke(mPerf);
++            ret = (int) retVal;
++        } catch (Exception e) {
++            Log.e(TAG, "Exception " + e);
++        }
++        return ret;
++    }
++
++/** @hide */
++    public int perfUXEngine_events(int opcode, int pid, String pkgName, int lat) {
++        return perfUXEngine_events(opcode, pid, pkgName, lat, null);
++     }
++
++/** @hide */
++    public int perfUXEngine_events(int opcode, int pid, String pkgName, int lat, String codePath) {
++        int ret = -1;
++        try {
++            if (sUXEngineEvents == null) {
++                return ret;
++            }
++
++            Object retVal = sUXEngineEvents.invoke(mPerf, opcode, pid, pkgName, lat,codePath);
++            ret = (int) retVal;
++        } catch (Exception e) {
++            Log.e(TAG, "Exception " + e);
++        }
++        return ret;
++    }
++
++
++/** @hide */
++    public String perfUXEngine_trigger(int opcode) {
++        String ret = null;
++        try {
++            if (sUXEngineTrigger == null) {
++                return ret;
++            }
++            Object retVal = sUXEngineTrigger.invoke(mPerf, opcode);
++            ret = (String) retVal;
++        } catch (Exception e) {
++            Log.e(TAG, "Exception " + e);
++        }
++        return ret;
++    }
++
++
++    public String perfGetProp(String prop_name, String def_val) {
++        String ret = "";
++        try {
++            if (sPerfGetPropFunc != null) {
++                Object retVal = sPerfGetPropFunc.invoke(mPerf, prop_name, def_val);
++                ret = (String)retVal;
++            }else {
++                ret = def_val;
++            }
++        } catch(Exception e) {
++            Log.e(TAG,"Exception " + e);
++        }
++        return ret;
++    }
++};
+diff --git a/core/java/android/util/apk/ApkSignatureVerifier.java b/core/java/android/util/apk/ApkSignatureVerifier.java
+index 71c8e98a0fa..7129632fc49 100644
+--- a/core/java/android/util/apk/ApkSignatureVerifier.java
++++ b/core/java/android/util/apk/ApkSignatureVerifier.java
+@@ -28,7 +28,9 @@ import android.content.pm.PackageParser.PackageParserException;
+ import android.content.pm.PackageParser.SigningDetails.SignatureSchemeVersion;
+ import android.content.pm.Signature;
+ import android.os.Trace;
++import android.util.Slog;
+ import android.util.jar.StrictJarFile;
++import android.util.BoostFramework;
+ 
+ import com.android.internal.util.ArrayUtils;
+ 
+@@ -57,6 +59,11 @@ public class ApkSignatureVerifier {
+ 
+     private static final AtomicReference<byte[]> sBuffer = new AtomicReference<>();
+ 
++    private static final String TAG = "ApkSignatureVerifier";
++
++    private static BoostFramework sPerfBoost = null;
++    private static boolean sIsPerfLockAcquired = false;
++
+     /**
+      * Verifies the provided APK and returns the certificates associated with each signer.
+      *
+@@ -167,7 +174,16 @@ public class ApkSignatureVerifier {
+             final Signature[] lastSigs;
+ 
+             Trace.traceBegin(TRACE_TAG_PACKAGE_MANAGER, "strictJarFileCtor");
+-
++            if (sPerfBoost == null) {
++                sPerfBoost = new BoostFramework();
++            }
++            if (sPerfBoost != null && !sIsPerfLockAcquired && verifyFull) {
++                //Use big enough number here to hold the perflock for entire PackageInstall session
++                sPerfBoost.perfHint(BoostFramework.VENDOR_HINT_PACKAGE_INSTALL_BOOST,
++                        null, Integer.MAX_VALUE, -1);
++                Slog.d(TAG, "Perflock acquired for PackageInstall ");
++                sIsPerfLockAcquired = true;
++            }
+             // we still pass verify = true to ctor to collect certs, even though we're not checking
+             // the whole jar.
+             jarFile = new StrictJarFile(
+@@ -232,6 +248,11 @@ public class ApkSignatureVerifier {
+             throw new PackageParserException(INSTALL_PARSE_FAILED_NO_CERTIFICATES,
+                     "Failed to collect certificates from " + apkPath, e);
+         } finally {
++            if (sIsPerfLockAcquired && sPerfBoost != null) {
++                sPerfBoost.perfLockRelease();
++                sIsPerfLockAcquired = false;
++                Slog.d(TAG, "Perflock released for PackageInstall ");
++            }
+             Trace.traceEnd(TRACE_TAG_PACKAGE_MANAGER);
+             closeQuietly(jarFile);
+         }
+diff --git a/core/java/com/android/internal/app/ActivityTrigger.java b/core/java/com/android/internal/app/ActivityTrigger.java
+new file mode 100644
+index 00000000000..6e03d952ef7
+--- /dev/null
++++ b/core/java/com/android/internal/app/ActivityTrigger.java
+@@ -0,0 +1,100 @@
++/* Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ *       copyright notice, this list of conditions and the following
++ *       disclaimer in the documentation and/or other materials provided
++ *       with the distribution.
++ *     * Neither the name of The Linux Foundation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
++ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
++ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++
++package com.android.internal.app;
++
++import android.content.ComponentName;
++import android.content.Intent;
++import android.content.pm.ActivityInfo;
++import android.content.pm.ApplicationInfo;
++import android.util.Log;
++
++public class ActivityTrigger
++{
++    private static final String TAG = "ActivityTrigger";
++
++    /** @hide */
++    public ActivityTrigger() {
++        //Log.d(TAG, "ActivityTrigger initialized");
++    }
++
++    /** @hide */
++    protected void finalize() {
++        native_at_deinit();
++    }
++
++    /** @hide */
++    public void activityStartTrigger(ApplicationInfo appInfo, int pid) {
++        int reserved =0;
++        String activity = null;
++        activity = appInfo.packageName + "/" + appInfo.processName + "/" +
++               appInfo.longVersionCode + "/" + pid;
++        native_at_startActivity(activity, reserved);
++    }
++
++    /** @hide */
++    public void activityResumeTrigger(Intent intent, ActivityInfo acInfo,
++            ApplicationInfo appInfo, boolean IsInFullScreen) {
++        ComponentName cn = intent.getComponent();
++        String activity = null;
++
++        if (cn != null)
++            activity = cn.flattenToString() + "/" + appInfo.versionCode;
++        native_at_resumeActivity(activity);
++    }
++
++    public void activityPauseTrigger(Intent intent, ActivityInfo acInfo, ApplicationInfo appInfo) {
++        ComponentName cn = intent.getComponent();
++        String activity = null;
++        Log.d(TAG, "ActivityTrigger activityPauseTrigger ");
++        if (null != cn && null != appInfo)
++            activity = cn.flattenToString() + "/" + appInfo.versionCode;
++        native_at_pauseActivity(activity);
++    }
++
++    public void activityStopTrigger(Intent intent, ActivityInfo acInfo, ApplicationInfo appInfo) {
++        ComponentName cn = intent.getComponent();
++        String activity = null;
++        Log.d(TAG, "ActivityTrigger activityStopTrigger ");
++        if (null != cn && null != appInfo)
++            activity = cn.flattenToString() + "/" + appInfo.versionCode;
++        native_at_stopActivity(activity);
++    }
++
++    public float activityMiscTrigger(int func, String activity, int flag, int type) {
++        return native_at_miscActivity(func, activity, flag, type);
++    }
++
++    private native int native_at_startActivity(String activity, int flags);
++    private native void native_at_resumeActivity(String activity);
++    private native void native_at_pauseActivity(String activity);
++    private native void native_at_stopActivity(String activity);
++    private native void native_at_deinit();
++    private native float native_at_miscActivity(int func, String activity, int flag, int type);
++}
+diff --git a/core/jni/Android.bp b/core/jni/Android.bp
+index 91a4e0b9b0f..777d6507233 100644
+--- a/core/jni/Android.bp
++++ b/core/jni/Android.bp
+@@ -214,6 +214,7 @@ cc_library_shared {
+         "com_android_internal_view_animation_NativeInterpolatorFactoryHelper.cpp",
+         "hwbinder/EphemeralStorage.cpp",
+         "fd_utils.cpp",
++        "com_android_internal_app_ActivityTrigger.cpp",
+         "android_hardware_input_InputWindowHandle.cpp",
+         "android_hardware_input_InputApplicationHandle.cpp",
+     ],
+diff --git a/core/jni/AndroidRuntime.cpp b/core/jni/AndroidRuntime.cpp
+index 8e5273aae7c..ce4c090c54b 100644
+--- a/core/jni/AndroidRuntime.cpp
++++ b/core/jni/AndroidRuntime.cpp
+@@ -233,6 +233,7 @@ extern int register_com_android_internal_os_FuseAppLoop(JNIEnv* env);
+ extern int register_com_android_internal_os_Zygote(JNIEnv *env);
+ extern int register_com_android_internal_os_ZygoteInit(JNIEnv *env);
+ extern int register_com_android_internal_util_VirtualRefBasePtr(JNIEnv *env);
++extern int register_com_android_internal_app_ActivityTrigger(JNIEnv *env);
+ 
+ // Namespace for Android Runtime flags applied during boot time.
+ static const char* RUNTIME_NATIVE_BOOT_NAMESPACE = "runtime_native_boot";
+@@ -1603,6 +1604,7 @@ static const RegJNIRec gRegJNI[] = {
+     REG_JNI(register_com_android_internal_content_NativeLibraryHelper),
+     REG_JNI(register_com_android_internal_os_AtomicDirectory),
+     REG_JNI(register_com_android_internal_os_FuseAppLoop),
++    REG_JNI(register_com_android_internal_app_ActivityTrigger),
+ };
+ 
+ /*
+diff --git a/core/jni/com_android_internal_app_ActivityTrigger.cpp b/core/jni/com_android_internal_app_ActivityTrigger.cpp
+new file mode 100644
+index 00000000000..5f849d4392b
+--- /dev/null
++++ b/core/jni/com_android_internal_app_ActivityTrigger.cpp
+@@ -0,0 +1,235 @@
++/* Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ *       copyright notice, this list of conditions and the following
++ *       disclaimer in the documentation and/or other materials provided
++ *       with the distribution.
++ *     * Neither the name of The Linux Foundation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
++ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
++ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++
++#define LOG_TAG "ActTriggerJNI"
++
++#include "jni.h"
++#include <nativehelper/JNIHelp.h>
++#include <android_runtime/AndroidRuntime.h>
++
++#include <dlfcn.h>
++#include <limits.h>
++#include <string.h>
++
++#include <cutils/properties.h>
++#include <utils/Log.h>
++
++namespace android
++{
++
++// ----------------------------------------------------------------------------
++/*
++ * Stuct containing handle to dynamically loaded lib as well as function
++ * pointers to key interfaces.
++ */
++typedef struct dlLibHandler {
++    void *dlhandle;
++    void (*startActivity)(const char *, int *);
++    void (*resumeActivity)(const char *);
++    void (*pauseActivity)(const char *);
++    void (*stopActivity)(const char *);
++    void (*init)(void);
++    void (*deinit)(void);
++    void (*miscActivity)(int, const char *, int, int, float *);
++    const char *dlname;
++}dlLibHandler;
++
++/*
++ * Init for activity trigger library
++ */
++static dlLibHandler mDlLibHandler = {
++    NULL, NULL, NULL, NULL, NULL, NULL,
++    NULL, NULL, "libqti-at.so"
++};
++
++// ----------------------------------------------------------------------------
++
++static void
++com_android_internal_app_ActivityTrigger_native_at_init()
++{
++    bool errored = false;
++
++    mDlLibHandler.dlhandle = dlopen(mDlLibHandler.dlname, RTLD_NOW | RTLD_LOCAL);
++    if (mDlLibHandler.dlhandle == NULL) {
++        return;
++    }
++
++    *(void **) (&mDlLibHandler.startActivity) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_start");
++    if (mDlLibHandler.startActivity == NULL) {
++        errored = true;
++    }
++    if (!errored) {
++        *(void **) (&mDlLibHandler.resumeActivity) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_resume");
++        if (mDlLibHandler.resumeActivity == NULL) {
++            errored = true;
++        }
++    }
++    if (!errored) {
++        *(void **) (&mDlLibHandler.pauseActivity) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_pause");
++        if (mDlLibHandler.pauseActivity == NULL) {
++            errored = true;
++        }
++    }
++    if (!errored) {
++        *(void **) (&mDlLibHandler.stopActivity) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_stop");
++        if (mDlLibHandler.stopActivity == NULL) {
++            errored = true;
++        }
++    }
++    if (!errored) {
++        *(void **) (&mDlLibHandler.init) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_init");
++        if (mDlLibHandler.init == NULL) {
++            errored = true;
++        }
++    }
++    if (!errored) {
++        *(void **) (&mDlLibHandler.miscActivity) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_misc");
++        if (mDlLibHandler.miscActivity == NULL) {
++            errored = true;
++        }
++    }
++    if (errored) {
++        mDlLibHandler.startActivity  = NULL;
++        mDlLibHandler.resumeActivity = NULL;
++        mDlLibHandler.pauseActivity  = NULL;
++        mDlLibHandler.stopActivity = NULL;
++        mDlLibHandler.miscActivity = NULL;
++        if (mDlLibHandler.dlhandle) {
++            dlclose(mDlLibHandler.dlhandle);
++            mDlLibHandler.dlhandle = NULL;
++        }
++    } else {
++        (*mDlLibHandler.init)();
++    }
++}
++
++static void
++com_android_internal_app_ActivityTrigger_native_at_deinit(JNIEnv *env, jobject clazz)
++{
++    if (mDlLibHandler.dlhandle) {
++        mDlLibHandler.startActivity  = NULL;
++        mDlLibHandler.resumeActivity = NULL;
++        mDlLibHandler.pauseActivity  = NULL;
++        mDlLibHandler.stopActivity = NULL;
++        mDlLibHandler.miscActivity = NULL;
++
++        *(void **) (&mDlLibHandler.deinit) = dlsym(mDlLibHandler.dlhandle, "activity_trigger_deinit");
++        if (mDlLibHandler.deinit) {
++            (*mDlLibHandler.deinit)();
++        }
++
++        dlclose(mDlLibHandler.dlhandle);
++        mDlLibHandler.dlhandle = NULL;
++    }
++}
++
++static jint
++com_android_internal_app_ActivityTrigger_native_at_startActivity(JNIEnv *env, jobject clazz, jstring activity, jint flags)
++{
++    int activiyFlags = flags;
++    if(mDlLibHandler.startActivity && activity) {
++       const char *actStr = env->GetStringUTFChars(activity, NULL);
++       if (actStr) {
++           (*mDlLibHandler.startActivity)(actStr, &activiyFlags);
++           env->ReleaseStringUTFChars(activity, actStr);
++       }
++    }
++    return activiyFlags;
++}
++
++static void
++com_android_internal_app_ActivityTrigger_native_at_resumeActivity(JNIEnv *env, jobject clazz, jstring activity)
++{
++    if(mDlLibHandler.resumeActivity && activity) {
++       const char *actStr = env->GetStringUTFChars(activity, NULL);
++       if (actStr) {
++           (*mDlLibHandler.resumeActivity)(actStr);
++           env->ReleaseStringUTFChars(activity, actStr);
++       }
++    }
++}
++
++static void
++com_android_internal_app_ActivityTrigger_native_at_pauseActivity(JNIEnv *env, jobject clazz, jstring activity)
++{
++    if(mDlLibHandler.pauseActivity && activity) {
++       const char *actStr = env->GetStringUTFChars(activity, NULL);
++       if (NULL != actStr) {
++           (*mDlLibHandler.pauseActivity)(actStr);
++           env->ReleaseStringUTFChars(activity, actStr);
++       }
++    }
++}
++
++static void
++com_android_internal_app_ActivityTrigger_native_at_stopActivity(JNIEnv *env, jobject clazz, jstring activity)
++{
++    if(mDlLibHandler.stopActivity && activity) {
++       const char *actStr = env->GetStringUTFChars(activity, NULL);
++       if (NULL != actStr) {
++           (*mDlLibHandler.stopActivity)(actStr);
++           env->ReleaseStringUTFChars(activity, actStr);
++       }
++    }
++}
++
++static jfloat
++com_android_internal_app_ActivityTrigger_native_at_miscActivity(JNIEnv *env, jobject clazz, jint func, jstring activity, jint type, jint flag)
++{
++    float scaleValue = -1.0f;
++    if (mDlLibHandler.miscActivity && activity && func) {
++        const char *actStr = env->GetStringUTFChars(activity, NULL);
++        if (actStr) {
++            (*mDlLibHandler.miscActivity)(func, actStr, type, flag, &scaleValue);
++            env->ReleaseStringUTFChars(activity, actStr);
++        }
++    }
++    return scaleValue;
++}
++
++// ----------------------------------------------------------------------------
++
++static JNINativeMethod gMethods[] = {
++    {"native_at_startActivity",  "(Ljava/lang/String;I)I", (void *)com_android_internal_app_ActivityTrigger_native_at_startActivity},
++    {"native_at_resumeActivity", "(Ljava/lang/String;)V", (void *)com_android_internal_app_ActivityTrigger_native_at_resumeActivity},
++    {"native_at_pauseActivity", "(Ljava/lang/String;)V", (void *)com_android_internal_app_ActivityTrigger_native_at_pauseActivity},
++    {"native_at_stopActivity", "(Ljava/lang/String;)V", (void *)com_android_internal_app_ActivityTrigger_native_at_stopActivity},
++    {"native_at_deinit",         "()V",                   (void *)com_android_internal_app_ActivityTrigger_native_at_deinit},
++    {"native_at_miscActivity", "(ILjava/lang/String;II)F", (void *)com_android_internal_app_ActivityTrigger_native_at_miscActivity},
++};
++
++int register_com_android_internal_app_ActivityTrigger(JNIEnv *env)
++{
++    com_android_internal_app_ActivityTrigger_native_at_init();
++
++    return AndroidRuntime::registerNativeMethods(env,
++            "com/android/internal/app/ActivityTrigger", gMethods, NELEM(gMethods));
++}
++
++}   // namespace android
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/PanelView.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/PanelView.java
+index 31600e391f3..ada6168a7a1 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/PanelView.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/PanelView.java
+@@ -51,6 +51,8 @@ import com.android.systemui.statusbar.SysuiStatusBarStateController;
+ import com.android.systemui.statusbar.VibratorHelper;
+ import com.android.systemui.statusbar.policy.KeyguardMonitor;
+ 
++import android.util.BoostFramework;
++
+ import java.io.FileDescriptor;
+ import java.io.PrintWriter;
+ import java.util.ArrayList;
+@@ -113,6 +115,11 @@ public abstract class PanelView extends FrameLayout {
+     private final FalsingManager mFalsingManager;
+     private final VibratorHelper mVibratorHelper;
+ 
++    /**
++     * For PanelView fling perflock call
++     */
++    private BoostFramework mPerf = null;
++
+     /**
+      * Whether an instant expand request is currently pending and we are just waiting for layout.
+      */
+@@ -219,6 +226,8 @@ public abstract class PanelView extends FrameLayout {
+         mVibratorHelper = Dependency.get(VibratorHelper.class);
+         mVibrateOnOpening = mContext.getResources().getBoolean(
+                 R.bool.config_vibrateOnIconAnimation);
++
++        mPerf = new BoostFramework();
+     }
+ 
+     protected void loadDimens() {
+@@ -781,6 +790,10 @@ public abstract class PanelView extends FrameLayout {
+                 animator.setDuration(mFixedDuration);
+             }
+         }
++        if (mPerf != null) {
++            String currentPackage = mContext.getPackageName();
++            mPerf.perfHint(BoostFramework.VENDOR_HINT_SCROLL_BOOST, currentPackage, -1, BoostFramework.Scroll.PANEL_VIEW);
++        }
+         animator.addListener(new AnimatorListenerAdapter() {
+             private boolean mCancelled;
+ 
+diff --git a/services/core/java/com/android/server/am/ActiveServices.java b/services/core/java/com/android/server/am/ActiveServices.java
+index f03d9df6ed5..c8a92416df0 100644
+--- a/services/core/java/com/android/server/am/ActiveServices.java
++++ b/services/core/java/com/android/server/am/ActiveServices.java
+@@ -73,6 +73,7 @@ import android.os.UserHandle;
+ import android.provider.Settings;
+ import android.util.ArrayMap;
+ import android.util.ArraySet;
++import android.util.BoostFramework;
+ import android.util.EventLog;
+ import android.util.PrintWriterPrinter;
+ import android.util.Slog;
+@@ -95,7 +96,9 @@ import com.android.server.LocalServices;
+ import com.android.server.SystemService;
+ import com.android.server.am.ActivityManagerService.ItemMatcher;
+ import com.android.server.uri.NeededUriGrants;
++import com.android.server.wm.ActivityRecord;
+ import com.android.server.wm.ActivityServiceConnectionsHolder;
++import com.android.server.wm.ActivityStack;
+ 
+ import java.io.FileDescriptor;
+ import java.io.IOException;
+@@ -137,6 +140,12 @@ public final class ActiveServices {
+     // at the same time.
+     final int mMaxStartingBackground;
+ 
++    //mPerf Object
++    public static BoostFramework mPerf = new BoostFramework();
++
++    // Flag to reschedule the services during app launch. Disable by default.
++    private static boolean SERVICE_RESCHEDULE = false;
++
+     final SparseArray<ServiceMap> mServiceMap = new SparseArray<>();
+ 
+     /**
+@@ -360,6 +369,8 @@ public final class ActiveServices {
+         }
+         mMaxStartingBackground = maxBg > 0
+                 ? maxBg : ActivityManager.isLowRamDeviceStatic() ? 1 : 8;
++        if(mPerf != null)
++            SERVICE_RESCHEDULE = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.am.reschedule_service", "false"));
+     }
+ 
+     void systemServicesReady() {
+@@ -2365,6 +2376,14 @@ public final class ActiveServices {
+                         r.pendingStarts.add(0, si);
+                         long dur = SystemClock.uptimeMillis() - si.deliveredTime;
+                         dur *= 2;
++                        if (SERVICE_RESCHEDULE && DEBUG_DELAYED_SERVICE) {
++                            Slog.w(TAG,"Can add more delay !!!"
++                               +" si.deliveredTime "+si.deliveredTime
++                               +" dur "+dur
++                               +" si.deliveryCount "+si.deliveryCount
++                               +" si.doneExecutingCount "+si.doneExecutingCount
++                               +" allowCancel "+allowCancel);
++                        }
+                         if (minDuration < dur) minDuration = dur;
+                         if (resetTime < dur) resetTime = dur;
+                     } else {
+@@ -2377,6 +2396,13 @@ public final class ActiveServices {
+             }
+ 
+             r.totalRestartCount++;
++            if (SERVICE_RESCHEDULE && DEBUG_DELAYED_SERVICE) {
++                Slog.w(TAG,"r.name "+r.name+" N "+N+" minDuration "+minDuration
++                       +" resetTime "+resetTime+" now "+now
++                       +" r.restartDelay "+r.restartDelay
++                       +" r.restartTime+resetTime "+(r.restartTime+resetTime)
++                       +" allowCancel "+allowCancel);
++            }
+             if (r.restartDelay == 0) {
+                 r.restartCount++;
+                 r.restartDelay = minDuration;
+@@ -2401,6 +2427,14 @@ public final class ActiveServices {
+             }
+ 
+             r.nextRestartTime = now + r.restartDelay;
++            if (SERVICE_RESCHEDULE && DEBUG_DELAYED_SERVICE) {
++                Slog.w(TAG,"r.name "+r.name+" N "+N+" minDuration "+minDuration
++                       +" resetTime "+resetTime+" now "+now
++                       +" r.restartDelay "+r.restartDelay
++                       +" r.restartTime+resetTime "+(r.restartTime+resetTime)
++                       +" r.nextRestartTime "+r.nextRestartTime
++                       +" allowCancel "+allowCancel);
++            }
+ 
+             // Make sure that we don't end up restarting a bunch of services
+             // all at the same time.
+@@ -2442,6 +2476,15 @@ public final class ActiveServices {
+         r.nextRestartTime = SystemClock.uptimeMillis() + r.restartDelay;
+         Slog.w(TAG, "Scheduling restart of crashed service "
+                 + r.shortInstanceName + " in " + r.restartDelay + "ms");
++
++        if (SERVICE_RESCHEDULE && DEBUG_DELAYED_SERVICE) {
++            for (int i=mRestartingServices.size()-1; i>=0; i--) {
++                ServiceRecord r2 = mRestartingServices.get(i);
++                Slog.w(TAG,"Restarting list - i "+i+" r2.nextRestartTime "
++                           +r2.nextRestartTime+" r2.name "+r2.name);
++            }
++        }
++
+         EventLog.writeEvent(EventLogTags.AM_SCHEDULE_SERVICE_RESTART,
+                 r.userId, r.shortInstanceName, r.restartDelay);
+ 
+@@ -2462,7 +2505,35 @@ public final class ActiveServices {
+             return;
+         }
+         try {
+-            bringUpServiceLocked(r, r.intent.getIntent().getFlags(), r.createdFromFg, true, false);
++            if(SERVICE_RESCHEDULE) {
++                boolean shouldDelay = false;
++                ActivityRecord top_rc = null;
++                ActivityStack stack = mAm.mStackSupervisor.mRootActivityContainer.getTopDisplayFocusedStack();
++                if(stack != null) {
++                    top_rc = stack.topRunningActivityLocked();
++                }
++
++                boolean isPersistent
++                        = !((r.serviceInfo.applicationInfo.flags&ApplicationInfo.FLAG_PERSISTENT) == 0);
++                if(top_rc != null) {
++                    if(top_rc.launching && !r.shortInstanceName.contains(top_rc.packageName)
++                            && !isPersistent) {
++                        shouldDelay = true;
++                    }
++                }
++                if(!shouldDelay) {
++                    bringUpServiceLocked(r, r.intent.getIntent().getFlags(), r.createdFromFg, true, false);
++                } else {
++                    if (DEBUG_DELAYED_SERVICE) {
++                        Slog.v(TAG, "Reschedule service restart due to app launch"
++                              +" r.shortInstanceName "+r.shortInstanceName+" r.app = "+r.app);
++                    }
++                    r.resetRestartCounter();
++                    scheduleServiceRestartLocked(r, true);
++                }
++            } else {
++                bringUpServiceLocked(r, r.intent.getIntent().getFlags(), r.createdFromFg, true, false);
++            }
+         } catch (TransactionTooLargeException e) {
+             // Ignore, it's been logged and nothing upstack cares.
+         }
+@@ -2712,6 +2783,11 @@ public final class ActiveServices {
+                 if (newService) {
+                     app.services.remove(r);
+                     r.setProcess(null);
++                    if (SERVICE_RESCHEDULE && DEBUG_DELAYED_SERVICE) {
++                    Slog.w(TAG, " Failed to create Service !!!! ."
++                           +"This will introduce huge delay...  "
++                           +r.shortInstanceName + " in " + r.restartDelay + "ms");
++                    }
+                 }
+ 
+                 // Retry.
+diff --git a/services/core/java/com/android/server/am/ActivityManagerConstants.java b/services/core/java/com/android/server/am/ActivityManagerConstants.java
+index 7fea5fc6481..dc8e7f68b9c 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerConstants.java
++++ b/services/core/java/com/android/server/am/ActivityManagerConstants.java
+@@ -25,11 +25,14 @@ import android.database.ContentObserver;
+ import android.net.Uri;
+ import android.os.Build;
+ import android.os.Handler;
++import android.os.SystemProperties;
++import android.os.Process;
+ import android.provider.DeviceConfig;
+ import android.provider.DeviceConfig.OnPropertiesChangedListener;
+ import android.provider.DeviceConfig.Properties;
+ import android.provider.Settings;
+ import android.text.TextUtils;
++import android.util.BoostFramework;
+ import android.util.KeyValueListParser;
+ import android.util.Slog;
+ 
+@@ -78,7 +81,8 @@ final class ActivityManagerConstants extends ContentObserver {
+     static final String KEY_MEMORY_INFO_THROTTLE_TIME = "memory_info_throttle_time";
+     static final String KEY_TOP_TO_FGS_GRACE_DURATION = "top_to_fgs_grace_duration";
+ 
+-    private static final int DEFAULT_MAX_CACHED_PROCESSES = 32;
++    private static int DEFAULT_MAX_CACHED_PROCESSES =
++            SystemProperties.getInt("ro.vendor.qti.sys.fw.bg_apps_limit",32);
+     private static final long DEFAULT_BACKGROUND_SETTLE_TIME = 60*1000;
+     private static final long DEFAULT_FGSERVICE_MIN_SHOWN_TIME = 2*1000;
+     private static final long DEFAULT_FGSERVICE_MIN_REPORT_TIME = 3*1000;
+@@ -271,6 +275,15 @@ final class ActivityManagerConstants extends ContentObserver {
+     // process limit.
+     public int CUR_MAX_CACHED_PROCESSES;
+ 
++    public static BoostFramework mPerf = new BoostFramework();
++
++    static boolean USE_TRIM_SETTINGS = true;
++    static int EMPTY_APP_PERCENT = 50;
++    static int TRIM_EMPTY_PERCENT = 100;
++    static int TRIM_CACHE_PERCENT = 100;
++    static long TRIM_ENABLE_MEMORY = 1073741824;
++    public static boolean allowTrim() { return Process.getTotalMemory() < TRIM_ENABLE_MEMORY ; }
++
+     // The maximum number of empty app processes we will let sit around.
+     public int CUR_MAX_EMPTY_PROCESSES;
+ 
+@@ -334,6 +347,18 @@ final class ActivityManagerConstants extends ContentObserver {
+                 MIN_AUTOMATIC_HEAP_DUMP_PSS_THRESHOLD_BYTES,
+                 context.getResources().getInteger(
+                         com.android.internal.R.integer.config_debugSystemServerPssThresholdBytes));
++        if (mPerf != null) {
++          // Maximum number of cached processes we will allow.
++            DEFAULT_MAX_CACHED_PROCESSES = MAX_CACHED_PROCESSES = Integer.valueOf(
++                                                 mPerf.perfGetProp("ro.vendor.qti.sys.fw.bg_apps_limit", "32"));
++
++           //Trim Settings
++            USE_TRIM_SETTINGS = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.sys.fw.use_trim_settings", "true"));
++            EMPTY_APP_PERCENT = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.empty_app_percent", "50"));
++            TRIM_EMPTY_PERCENT = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.trim_empty_percent", "100"));
++            TRIM_CACHE_PERCENT = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.trim_cache_percent", "100"));
++            TRIM_ENABLE_MEMORY = Long.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.trim_enable_memory", "1073741824"));
++        }
+     }
+ 
+     public void start(ContentResolver resolver) {
+@@ -366,7 +391,27 @@ final class ActivityManagerConstants extends ContentObserver {
+     }
+ 
+     public static int computeEmptyProcessLimit(int totalProcessLimit) {
++        if(USE_TRIM_SETTINGS && allowTrim()) {
++            return totalProcessLimit*EMPTY_APP_PERCENT/100;
++        } else {
+         return totalProcessLimit/2;
++        }
++    }
++
++    public static int computeTrimEmptyApps(int rawMaxEmptyProcesses) {
++        if (USE_TRIM_SETTINGS && allowTrim()) {
++            return rawMaxEmptyProcesses*TRIM_EMPTY_PERCENT/100;
++        } else {
++            return rawMaxEmptyProcesses/2;
++        }
++    }
++
++    public static int computeTrimCachedApps(int rawMaxEmptyProcesses, int totalProcessLimit) {
++        if (USE_TRIM_SETTINGS && allowTrim()) {
++            return totalProcessLimit*TRIM_CACHE_PERCENT/100;
++        } else {
++            return (totalProcessLimit-rawMaxEmptyProcesses)/3;
++        }
+     }
+ 
+     @Override
+@@ -511,7 +556,9 @@ final class ActivityManagerConstants extends ContentObserver {
+         // additional enforced limit.
+         final int rawMaxEmptyProcesses = computeEmptyProcessLimit(MAX_CACHED_PROCESSES);
+         CUR_TRIM_EMPTY_PROCESSES = rawMaxEmptyProcesses/2;
+-        CUR_TRIM_CACHED_PROCESSES = (MAX_CACHED_PROCESSES-rawMaxEmptyProcesses)/3;
++        CUR_TRIM_EMPTY_PROCESSES = computeTrimEmptyApps(rawMaxEmptyProcesses);
++        CUR_TRIM_CACHED_PROCESSES =
++                computeTrimCachedApps(rawMaxEmptyProcesses, MAX_CACHED_PROCESSES);
+     }
+ 
+     void dump(PrintWriter pw) {
+diff --git a/services/core/java/com/android/server/am/ActivityManagerService.java b/services/core/java/com/android/server/am/ActivityManagerService.java
+index 9c6e85b3563..36fbc347fb6 100644
+--- a/services/core/java/com/android/server/am/ActivityManagerService.java
++++ b/services/core/java/com/android/server/am/ActivityManagerService.java
+@@ -299,6 +299,7 @@ import android.view.IRecentsAnimationRunner;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.WindowManager;
++import android.util.BoostFramework;
+ import android.view.autofill.AutofillManagerInternal;
+ 
+ import com.android.internal.R;
+@@ -310,6 +311,7 @@ import com.android.internal.app.IAppOpsService;
+ import com.android.internal.app.ProcessMap;
+ import com.android.internal.app.SystemUserHomeActivity;
+ import com.android.internal.app.procstats.ProcessStats;
++import com.android.internal.app.ActivityTrigger;
+ import com.android.internal.content.PackageHelper;
+ import com.android.internal.messages.nano.SystemMessageProto.SystemMessage;
+ import com.android.internal.notification.SystemNotificationChannels;
+@@ -358,6 +360,7 @@ import com.android.server.utils.PriorityDump;
+ import com.android.server.vr.VrManagerInternal;
+ import com.android.server.wm.ActivityMetricsLaunchObserver;
+ import com.android.server.wm.ActivityServiceConnectionsHolder;
++import com.android.server.wm.ActivityStackSupervisor;
+ import com.android.server.wm.ActivityTaskManagerInternal;
+ import com.android.server.wm.ActivityTaskManagerService;
+ import com.android.server.wm.WindowManagerService;
+@@ -545,6 +548,12 @@ public class ActivityManagerService extends IActivityManager.Stub
+     private static final int NATIVE_DUMP_TIMEOUT_MS = 2000; // 2 seconds;
+     private static final int JAVA_DUMP_MINIMUM_SIZE = 100; // 100 bytes.
+ 
++    /* Freq Aggr boost objects */
++    public static BoostFramework mPerfServiceStartHint = null;
++    /* UX perf event object */
++    public static BoostFramework mUxPerf = new BoostFramework();
++    public static boolean mForceStopKill = false;
++
+     OomAdjuster mOomAdjuster;
+     final LowMemDetector mLowMemDetector;
+ 
+@@ -553,6 +562,9 @@ public class ActivityManagerService extends IActivityManager.Stub
+ 
+     private Installer mInstaller;
+ 
++    /** Run all ActivityStacks through this */
++    ActivityStackSupervisor mStackSupervisor;
++
+     final InstrumentationReporter mInstrumentationReporter = new InstrumentationReporter();
+ 
+     final ArrayList<ActiveInstrumentation> mActiveInstrumentation = new ArrayList<>();
+@@ -1537,8 +1549,20 @@ public class ActivityManagerService extends IActivityManager.Stub
+ 
+     static final String SERVICE_RECORD_KEY = "servicerecord";
+ 
++    static final ActivityTrigger mActivityTrigger = new ActivityTrigger();
++
+     long mLastMemUsageReportTime = 0;
+ 
++    // Min aging threshold in milliseconds to consider a B-service
++    int mMinBServiceAgingTime =
++            SystemProperties.getInt("ro.vendor.qti.sys.fw.bservice_age", 5000);
++    // Threshold for B-services when in memory pressure
++    int mBServiceAppThreshold =
++            SystemProperties.getInt("ro.vendor.qti.sys.fw.bservice_limit", 5);
++    // Enable B-service aging propagation on memory pressure.
++    boolean mEnableBServicePropagation =
++            SystemProperties.getBoolean("ro.vendor.qti.sys.fw.bservice_enable", false);
++
+     /**
+      * Flag whether the current user is a "monkey", i.e. whether
+      * the UI is driven by a UI automation tool.
+@@ -2529,6 +2553,7 @@ public class ActivityManagerService extends IActivityManager.Stub
+         mActivityTaskManager.initialize(mIntentFirewall, mPendingIntentController,
+                 DisplayThread.get().getLooper());
+         mAtmInternal = LocalServices.getService(ActivityTaskManagerInternal.class);
++        mStackSupervisor = mActivityTaskManager.mStackSupervisor;
+ 
+         mProcessCpuThread = new Thread("CpuTracker") {
+             @Override
+@@ -3517,11 +3542,51 @@ public class ActivityManagerService extends IActivityManager.Stub
+                     bOptions, userId);
+     }
+ 
+-    @Override
+     public final int startActivityFromRecents(int taskId, Bundle bOptions) {
+         return mActivityTaskManager.startActivityFromRecents(taskId, bOptions);
+     }
+ 
++    public int startActivityAsUserEmpty(Bundle options) {
++        ArrayList<String> pApps = options.getStringArrayList("start_empty_apps");
++        if (pApps != null && pApps.size() > 0) {
++            Iterator<String> apps_itr = pApps.iterator();
++            while (apps_itr.hasNext()) {
++                ProcessRecord empty_app = null;
++                String app_str = apps_itr.next();
++                if (app_str == null)
++                    continue;
++                synchronized (this) {
++                    Intent intent_l = null;
++                    try {
++                        intent_l = mContext.getPackageManager().getLaunchIntentForPackage(app_str);
++                        if (intent_l == null)
++                            continue;
++                        ActivityInfo aInfo = mStackSupervisor.resolveActivity(intent_l, null,
++                                                                          0, null, 0, 0);
++                        if (aInfo == null)
++                            continue;
++                        empty_app = startProcessLocked(
++                            app_str,
++                            aInfo.applicationInfo,
++                            false /* knownToBeDead */,
++                            0 /* intentFlags */,
++                           sNullHostingRecord /* hostingRecord */,
++                           ZYGOTE_POLICY_FLAG_EMPTY,
++                           false /* allowWhileBooting */,
++                           false /* isolated */,
++                           true /* keepIfLarge */);
++                        if (empty_app != null)
++                            updateOomAdjLocked(empty_app, true, OomAdjuster.OOM_ADJ_REASON_NONE);
++                    } catch (Exception e) {
++                        if (DEBUG_PROCESSES)
++                            Slog.w(TAG, "Exception raised trying to start app as empty " + e);
++                    }
++                }
++            }
++        }
++        return 1;
++    }
++
+     @Override
+     public void startRecentsActivity(Intent intent, IAssistDataReceiver assistDataReceiver,
+             IRecentsAnimationRunner recentsAnimationRunner) {
+@@ -3745,6 +3810,12 @@ public class ActivityManagerService extends IActivityManager.Stub
+                 mAllowLowerMemLevel = false;
+                 doLowMem = false;
+             }
++
++            if (mUxPerf != null && !mForceStopKill) {
++                mUxPerf.perfUXEngine_events(BoostFramework.UXE_EVENT_KILL, 0, app.processName, 0);
++                mUxPerf.perfHint(BoostFramework.VENDOR_HINT_KILL, app.processName, pid, 0);
++            }
++
+             EventLog.writeEvent(EventLogTags.AM_PROC_DIED, app.userId, app.pid, app.processName,
+                     app.setAdj, app.setProcState);
+             if (DEBUG_CLEANUP) Slog.v(TAG_CLEANUP,
+@@ -4644,6 +4715,10 @@ public class ActivityManagerService extends IActivityManager.Stub
+                 Slog.i(TAG, "Force stopping u" + userId + ": " + reason);
+             }
+ 
++            if (mUxPerf != null) {
++                mUxPerf.perfHint(BoostFramework.VENDOR_HINT_KILL, packageName, appId, 0);
++            }
++
+             mAppErrors.resetProcessCrashTimeLocked(packageName == null, appId, userId);
+         }
+ 
+@@ -5172,6 +5247,8 @@ public class ActivityManagerService extends IActivityManager.Stub
+                 (int) (SystemClock.elapsedRealtime() - app.startTime),
+                 app.hostingRecord.getType(),
+                 (app.hostingRecord.getName() != null ? app.hostingRecord.getName() : ""));
++        //send start notification to AT with the starting app's info.
++        mActivityTrigger.activityStartTrigger(app.info, app.pid);
+         return true;
+     }
+ 
+@@ -17779,6 +17856,11 @@ public class ActivityManagerService extends IActivityManager.Stub
+                     processName, abiOverride, uid, crashHandler);
+         }
+ 
++        @Override
++        public int startActivityAsUserEmpty(Bundle options) {
++            return ActivityManagerService.this.startActivityAsUserEmpty(options);
++        }
++
+         @Override
+         public void killForegroundAppsForUser(int userHandle) {
+             synchronized (ActivityManagerService.this) {
+diff --git a/services/core/java/com/android/server/am/OomAdjuster.java b/services/core/java/com/android/server/am/OomAdjuster.java
+index dbf8acf74db..37be2633b9f 100644
+--- a/services/core/java/com/android/server/am/OomAdjuster.java
++++ b/services/core/java/com/android/server/am/OomAdjuster.java
+@@ -73,6 +73,7 @@ import android.os.Trace;
+ import android.os.UserHandle;
+ import android.util.ArrayMap;
+ import android.util.ArraySet;
++import android.util.BoostFramework;
+ import android.util.Slog;
+ import android.util.proto.ProtoOutputStream;
+ 
+@@ -162,6 +163,15 @@ public final class OomAdjuster {
+     private final ActivityManagerService mService;
+     private final ProcessList mProcessList;
+ 
++    // Min aging threshold in milliseconds to consider a B-service
++    int mMinBServiceAgingTime = 5000;
++    // Threshold for B-services when in memory pressure
++    int mBServiceAppThreshold = 5;
++    // Enable B-service aging propagation on memory pressure.
++    boolean mEnableBServicePropagation = false;
++
++    public static BoostFramework mPerf = new BoostFramework();
++
+     OomAdjuster(ActivityManagerService service, ProcessList processList, ActiveUids activeUids) {
+         mService = service;
+         mProcessList = processList;
+@@ -171,6 +181,12 @@ public final class OomAdjuster {
+         mConstants = mService.mConstants;
+         mAppCompact = new AppCompactor(mService);
+ 
++        if(mPerf != null) {
++            mMinBServiceAgingTime = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_age", "5000"));
++            mBServiceAppThreshold = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_limit", "5"));
++            mEnableBServicePropagation = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_enable", "false"));
++        }
++
+         // The process group is usually critical to the response time of foreground app, so the
+         // setter should apply it as soon as possible.
+         final ServiceThread adjusterThread = new ServiceThread(TAG, TOP_APP_PRIORITY_BOOST,
+@@ -315,6 +331,9 @@ public final class OomAdjuster {
+         int curCachedImpAdj = 0;
+         int curEmptyAdj = ProcessList.CACHED_APP_MIN_ADJ + ProcessList.CACHED_APP_IMPORTANCE_LEVELS;
+         int nextEmptyAdj = curEmptyAdj + (ProcessList.CACHED_APP_IMPORTANCE_LEVELS * 2);
++        ProcessRecord selectedAppRecord = null;
++        long serviceLastActivity = 0;
++        int numBServices = 0;
+ 
+         boolean retryCycles = false;
+ 
+@@ -327,6 +346,35 @@ public final class OomAdjuster {
+         }
+         for (int i = N - 1; i >= 0; i--) {
+             ProcessRecord app = mProcessList.mLruProcesses.get(i);
++            if (mEnableBServicePropagation && app.serviceb
++                    && (app.curAdj == ProcessList.SERVICE_B_ADJ)) {
++                numBServices++;
++                for (int s = app.services.size() - 1; s >= 0; s--) {
++                    ServiceRecord sr = app.services.valueAt(s);
++                    if (DEBUG_OOM_ADJ) Slog.d(TAG,"app.processName = " + app.processName
++                            + " serviceb = " + app.serviceb + " s = " + s + " sr.lastActivity = "
++                            + sr.lastActivity + " packageName = " + sr.packageName
++                            + " processName = " + sr.processName);
++                    if (SystemClock.uptimeMillis() - sr.lastActivity
++                            < mMinBServiceAgingTime) {
++                        if (DEBUG_OOM_ADJ) {
++                            Slog.d(TAG,"Not aged enough!!!");
++                        }
++                        continue;
++                    }
++                    if (serviceLastActivity == 0) {
++                        serviceLastActivity = sr.lastActivity;
++                        selectedAppRecord = app;
++                    } else if (sr.lastActivity < serviceLastActivity) {
++                        serviceLastActivity = sr.lastActivity;
++                        selectedAppRecord = app;
++                    }
++                }
++            }
++            if (DEBUG_OOM_ADJ && selectedAppRecord != null) Slog.d(TAG,
++                    "Identified app.processName = " + selectedAppRecord.processName
++                    + " app.pid = " + selectedAppRecord.pid);
++
+             if (!app.killedByAm && app.thread != null) {
+                 app.procStateChanged = false;
+                 computeOomAdjLocked(app, ProcessList.UNKNOWN_ADJ, TOP_APP, true, now, false);
+@@ -519,6 +567,15 @@ public final class OomAdjuster {
+             }
+         }
+ 
++        if ((numBServices > mBServiceAppThreshold) && (true == mService.mAllowLowerMemLevel)
++                && (selectedAppRecord != null)) {
++            ProcessList.setOomAdj(selectedAppRecord.pid, selectedAppRecord.info.uid,
++                    ProcessList.CACHED_APP_MAX_ADJ);
++            selectedAppRecord.setAdj = selectedAppRecord.curAdj;
++            if (DEBUG_OOM_ADJ) Slog.d(TAG,"app.processName = " + selectedAppRecord.processName
++                        + " app.pid = " + selectedAppRecord.pid + " is moved to higher adj");
++        }
++
+         mService.incrementProcStateSeqAndNotifyAppsLocked();
+ 
+         mNumServiceProcs = mNewNumServiceProcs;
+diff --git a/services/core/java/com/android/server/am/ProcessList.java b/services/core/java/com/android/server/am/ProcessList.java
+index 211649a8726..20ed35c0702 100644
+--- a/services/core/java/com/android/server/am/ProcessList.java
++++ b/services/core/java/com/android/server/am/ProcessList.java
+@@ -84,6 +84,7 @@ import android.util.Slog;
+ import android.util.SparseArray;
+ import android.util.SparseBooleanArray;
+ import android.util.StatsLog;
++import android.util.BoostFramework;
+ import android.view.Display;
+ 
+ import com.android.internal.annotations.GuardedBy;
+@@ -386,6 +387,11 @@ public final class ProcessList {
+     final ArrayMap<AppZygote, ArrayList<ProcessRecord>> mAppZygoteProcesses =
+             new ArrayMap<AppZygote, ArrayList<ProcessRecord>>();
+ 
++    /**
++     * BoostFramework Object
++     */
++    public static BoostFramework mPerfServiceStartHint = new BoostFramework();
++
+     final class IsolatedUidRange {
+         @VisibleForTesting
+         public final int mFirstUid;
+@@ -1833,6 +1839,13 @@ public final class ProcessList {
+                         app.info.dataDir, invokeWith, app.info.packageName, true,
+                         new String[] {PROC_START_SEQ_IDENT + app.startSeq});
+             }
++            if (mPerfServiceStartHint != null) {
++                if ((hostingRecord.getType() != null) && (hostingRecord.getType().equals("activity"))) {
++                    if (startResult != null) {
++                        mPerfServiceStartHint.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, app.processName, startResult.pid, BoostFramework.Launch.TYPE_START_PROC);
++                    }
++                }
++            }
+             checkSlow(startTime, "startProcess: returned from zygote!");
+             return startResult;
+         } finally {
+diff --git a/services/core/java/com/android/server/am/ProcessRecord.java b/services/core/java/com/android/server/am/ProcessRecord.java
+index 66206b66905..11a19a3b0a7 100644
+--- a/services/core/java/com/android/server/am/ProcessRecord.java
++++ b/services/core/java/com/android/server/am/ProcessRecord.java
+@@ -55,6 +55,7 @@ import android.util.SparseArray;
+ import android.util.StatsLog;
+ import android.util.TimeUtils;
+ import android.util.proto.ProtoOutputStream;
++import android.util.BoostFramework;
+ 
+ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.app.procstats.ProcessState;
+@@ -784,6 +785,7 @@ class ProcessRecord implements WindowProcessListener {
+     void kill(String reason, boolean noisy) {
+         if (!killedByAm) {
+             Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "kill");
++            BoostFramework ux_perf = new BoostFramework();
+             if (mService != null && (noisy || info.uid == mService.mCurOomAdjUid)) {
+                 mService.reportUidInfoMessageLocked(TAG,
+                         "Killing " + toShortString() + " (adj " + setAdj + "): " + reason,
+@@ -800,6 +802,12 @@ class ProcessRecord implements WindowProcessListener {
+                 killed = true;
+                 killedByAm = true;
+             }
++            if (ux_perf != null && !mService.mForceStopKill) {
++                ux_perf.perfUXEngine_events(BoostFramework.UXE_EVENT_KILL, 0, this.processName, 0);
++                ux_perf.perfHint(BoostFramework.VENDOR_HINT_KILL, this.processName, pid, 0);
++            } else {
++                mService.mForceStopKill = false;
++            }
+             Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+         }
+     }
+diff --git a/services/core/java/com/android/server/wm/ActivityDisplay.java b/services/core/java/com/android/server/wm/ActivityDisplay.java
+index 637ad0384da..eb92eaf8cf7 100644
+--- a/services/core/java/com/android/server/wm/ActivityDisplay.java
++++ b/services/core/java/com/android/server/wm/ActivityDisplay.java
+@@ -40,6 +40,8 @@ import static com.android.server.am.ActivityDisplayProto.RESUMED_ACTIVITY;
+ import static com.android.server.am.ActivityDisplayProto.SINGLE_TASK_INSTANCE;
+ import static com.android.server.am.ActivityDisplayProto.STACKS;
+ import static com.android.server.wm.ActivityStack.ActivityState.RESUMED;
++import static com.android.server.wm.ActivityStack.ActivityState.DESTROYED;
++import static com.android.server.wm.ActivityStack.ActivityState.STOPPED;
+ import static com.android.server.wm.ActivityStack.STACK_VISIBILITY_VISIBLE;
+ import static com.android.server.wm.ActivityStackSupervisor.TAG_TASKS;
+ import static com.android.server.wm.ActivityTaskManagerDebugConfig.DEBUG_STACK;
+@@ -65,6 +67,7 @@ import android.util.IntArray;
+ import android.util.Slog;
+ import android.util.proto.ProtoOutputStream;
+ import android.view.Display;
++import android.util.BoostFramework;
+ 
+ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.server.am.EventLogTags;
+@@ -84,6 +87,11 @@ class ActivityDisplay extends ConfigurationContainer<ActivityStack>
+     static final int POSITION_TOP = Integer.MAX_VALUE;
+     static final int POSITION_BOTTOM = Integer.MIN_VALUE;
+ 
++    public static boolean mPerfSendTapHint = false;
++    public static boolean mIsPerfBoostAcquired = false;
++    public static int mPerfHandle = -1;
++    public BoostFramework mPerfBoost = null;
++    public BoostFramework mUxPerf = null;
+ 
+     /**
+      * Counter for next free stack ID to use for dynamic activity stacks. Unique across displays.
+@@ -594,6 +602,39 @@ class ActivityDisplay extends ConfigurationContainer<ActivityStack>
+         return someActivityPaused;
+     }
+ 
++    void acquireAppLaunchPerfLock(ActivityRecord r) {
++       /* Acquire perf lock during new app launch */
++       if (mPerfBoost == null) {
++           mPerfBoost = new BoostFramework();
++       }
++       if (mPerfBoost != null) {
++           mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_V1);
++           mPerfSendTapHint = true;
++           mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_V2);
++
++           if(mPerfBoost.perfGetFeedback(BoostFramework.VENDOR_FEEDBACK_WORKLOAD_TYPE, r.packageName) == BoostFramework.WorkloadType.GAME)
++           {
++               mPerfHandle = mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_GAME);
++           } else {
++               mPerfHandle = mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_V3);
++           }
++           if (mPerfHandle > 0)
++               mIsPerfBoostAcquired = true;
++           // Start IOP
++           if(r.appInfo != null && r.appInfo.sourceDir != null) {
++               mPerfBoost.perfIOPrefetchStart(-1,r.packageName,
++                   r.appInfo.sourceDir.substring(0, r.appInfo.sourceDir.lastIndexOf('/')));
++           }
++       }
++   }
++
++   void acquireUxPerfLock(int opcode, String packageName) {
++        mUxPerf = new BoostFramework();
++        if (mUxPerf != null) {
++            mUxPerf.perfUXEngine_events(opcode, 0, packageName, 0);
++        }
++    }
++
+     /**
+      * Find task for putting the Activity in.
+      */
+@@ -617,6 +658,15 @@ class ActivityDisplay extends ConfigurationContainer<ActivityStack>
+             // matches not on the specified display.
+             if (mTmpFindTaskResult.mRecord != null) {
+                 if (mTmpFindTaskResult.mIdealMatch) {
++                    if(mTmpFindTaskResult.mRecord.getState() == DESTROYED) {
++                        /*It's a new app launch */
++                        acquireAppLaunchPerfLock(r);
++                    }
++
++                    if(mTmpFindTaskResult.mRecord.getState() == STOPPED) {
++                        /*Warm launch */
++                        acquireUxPerfLock(BoostFramework.UXE_EVENT_SUB_LAUNCH, r.packageName);
++                    }
+                     result.setTo(mTmpFindTaskResult);
+                     return;
+                 } else if (isPreferredDisplay) {
+@@ -627,6 +677,11 @@ class ActivityDisplay extends ConfigurationContainer<ActivityStack>
+                 }
+             }
+         }
++
++        /* Acquire perf lock *only* during new app launch */
++        if ((mTmpFindTaskResult.mRecord == null) || (mTmpFindTaskResult.mRecord.getState() == DESTROYED)) {
++            acquireAppLaunchPerfLock(r);
++        }
+     }
+ 
+     /**
+diff --git a/services/core/java/com/android/server/wm/ActivityMetricsLogger.java b/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+index bc0f7471524..f33be67e5c5 100644
+--- a/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
++++ b/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+@@ -78,6 +78,7 @@ import android.os.Looper;
+ import android.os.Message;
+ import android.os.SystemClock;
+ import android.os.Trace;
++import android.util.BoostFramework;
+ import android.util.EventLog;
+ import android.util.Log;
+ import android.util.Slog;
+@@ -152,6 +153,9 @@ class ActivityMetricsLogger {
+     private ArtManagerInternal mArtManagerInternal;
+     private final StringBuilder mStringBuilder = new StringBuilder();
+ 
++    public static BoostFramework mUxPerf = new BoostFramework();
++    private static ActivityRecord mLaunchedActivity;
++
+     /**
+      * Due to the global single concurrent launch sequence, all calls to this observer must be made
+      * in-order on the same thread to fulfill the "happens-before" guarantee in LaunchObserver.
+@@ -676,6 +680,8 @@ class ActivityMetricsLogger {
+                 return;
+             }
+ 
++            mLaunchedActivity = info.launchedActivity;
++
+             // Take a snapshot of the transition info before sending it to the handler for logging.
+             // This will avoid any races with other operations that modify the ActivityRecord.
+             final WindowingModeTransitionInfoSnapshot infoSnapshot =
+@@ -778,7 +784,22 @@ class ActivityMetricsLogger {
+         sb.append(info.launchedActivityShortComponentName);
+         sb.append(": ");
+         TimeUtils.formatDuration(info.windowsDrawnDelayMs, sb);
++
++        if (mUxPerf != null) {
++            mUxPerf.perfUXEngine_events(BoostFramework.UXE_EVENT_DISPLAYED_ACT, 0, info.packageName, info.windowsDrawnDelayMs);
++        }
++
+         Log.i(TAG, sb.toString());
++
++        int isGame = mLaunchedActivity.isAppInfoGame();
++        if (mUxPerf !=  null) {
++            mUxPerf.perfUXEngine_events(BoostFramework.UXE_EVENT_GAME, 0, info.packageName, isGame);
++        }
++
++        if (mLaunchedActivity.mPerf != null && mLaunchedActivity.perfActivityBoostHandler > 0) {
++            mLaunchedActivity.mPerf.perfLockReleaseHandler(mLaunchedActivity.perfActivityBoostHandler);
++            mLaunchedActivity.perfActivityBoostHandler = -1;
++        }
+     }
+ 
+     private int convertAppStartTransitionType(int tronType) {
+diff --git a/services/core/java/com/android/server/wm/ActivityRecord.java b/services/core/java/com/android/server/wm/ActivityRecord.java
+index f3d1af81436..2e668ff3ca9 100644
+--- a/services/core/java/com/android/server/wm/ActivityRecord.java
++++ b/services/core/java/com/android/server/wm/ActivityRecord.java
+@@ -197,6 +197,7 @@ import android.os.UserHandle;
+ import android.os.storage.StorageManager;
+ import android.provider.Settings;
+ import android.service.voice.IVoiceInteractionSession;
++import android.util.BoostFramework;
+ import android.util.EventLog;
+ import android.util.Log;
+ import android.util.MergedConfiguration;
+@@ -237,10 +238,12 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Objects;
+ 
++import android.os.AsyncTask;
++
+ /**
+  * An entry in the history stack, representing an activity.
+  */
+-final class ActivityRecord extends ConfigurationContainer {
++public final class ActivityRecord extends ConfigurationContainer {
+     private static final String TAG = TAG_WITH_CLASS_NAME ? "ActivityRecord" : TAG_ATM;
+     private static final String TAG_CONFIGURATION = TAG + POSTFIX_CONFIGURATION;
+     private static final String TAG_SAVED_STATE = TAG + POSTFIX_SAVED_STATE;
+@@ -279,7 +282,7 @@ final class ActivityRecord extends ConfigurationContainer {
+     final ComponentName mActivityComponent;  // the intent component, or target of an alias.
+     final String shortComponentName; // the short component name of the intent
+     final String resolvedType; // as per original caller;
+-    final String packageName; // the package implementing intent's component
++    public final String packageName; // the package implementing intent's component
+     final String processName; // process where this component wants to run
+     final String taskAffinity; // as per ActivityInfo.taskAffinity
+     final boolean stateNotNeeded; // As per ActivityInfo.flags
+@@ -300,6 +303,7 @@ final class ActivityRecord extends ConfigurationContainer {
+     private int theme;              // resource identifier of activity's theme.
+     private int realTheme;          // actual theme resource we will use, never 0.
+     private int windowFlags;        // custom window flags for preview window.
++    public int perfActivityBoostHandler = -1; //perflock handler when activity is created.
+     private TaskRecord task;        // the task this is in.
+     private long createTime = System.currentTimeMillis();
+     long lastVisibleTime;         // last time this activity became visible
+@@ -348,6 +352,7 @@ final class ActivityRecord extends ConfigurationContainer {
+     private boolean mDeferHidingClient; // If true we told WM to defer reporting to the client
+                                         // process that it is hidden.
+     boolean sleeping;       // have we told the activity to sleep?
++    public boolean launching;      // is activity launch in progress?
+     boolean nowVisible;     // is this activity's window visible?
+     boolean mDrawn;          // is this activity's window drawn?
+     boolean mClientVisibilityDeferred;// was the visibility change message to client deferred?
+@@ -401,6 +406,9 @@ final class ActivityRecord extends ConfigurationContainer {
+     boolean pendingVoiceInteractionStart;   // Waiting for activity-invoked voice session
+     IVoiceInteractionSession voiceSession;  // Voice interaction session for this activity
+ 
++    public BoostFramework mPerf = null;
++    public BoostFramework mPerf_iop = null;
++
+     // A hint to override the window specified rotation animation, or -1
+     // to use the window specified value. We use this so that
+     // we can select the right animation in the cases of starting
+@@ -1111,6 +1119,9 @@ final class ActivityRecord extends ConfigurationContainer {
+             // Gets launch display id from options. It returns INVALID_DISPLAY if not set.
+             mHandoverLaunchDisplayId = options.getLaunchDisplayId();
+         }
++
++        if (mPerf == null)
++            mPerf = new BoostFramework();
+     }
+ 
+     void setProcess(WindowProcessController proc) {
+@@ -2411,6 +2422,15 @@ final class ActivityRecord extends ConfigurationContainer {
+         }
+     }
+ 
++    public int isAppInfoGame() {
++        int isGame = 0;
++        if (appInfo != null) {
++            isGame = (appInfo.category == ApplicationInfo.CATEGORY_GAME ||
++                      (appInfo.flags & ApplicationInfo.FLAG_IS_GAME) == ApplicationInfo.FLAG_IS_GAME) ? 1 : 0;
++        }
++        return isGame;
++    }
++
+     /**
+      * Called when the starting window for this container is drawn.
+      */
+@@ -2449,6 +2469,7 @@ final class ActivityRecord extends ConfigurationContainer {
+             if (DEBUG_SWITCH) Log.v(TAG_SWITCH, "windowsVisibleLocked(): " + this);
+             if (!nowVisible) {
+                 nowVisible = true;
++                launching = false;
+                 lastVisibleTime = SystemClock.uptimeMillis();
+                 mAtmService.scheduleAppGcsLocked();
+             }
+@@ -2460,6 +2481,7 @@ final class ActivityRecord extends ConfigurationContainer {
+         synchronized (mAtmService.mGlobalLock) {
+             if (DEBUG_SWITCH) Log.v(TAG_SWITCH, "windowsGone(): " + this);
+             nowVisible = false;
++            launching = false;
+         }
+     }
+ 
+diff --git a/services/core/java/com/android/server/wm/ActivityStack.java b/services/core/java/com/android/server/wm/ActivityStack.java
+index 1a9b11cd62d..658af47d1c2 100644
+--- a/services/core/java/com/android/server/wm/ActivityStack.java
++++ b/services/core/java/com/android/server/wm/ActivityStack.java
+@@ -146,6 +146,7 @@ import android.os.SystemClock;
+ import android.os.UserHandle;
+ import android.service.voice.IVoiceInteractionSession;
+ import android.util.ArraySet;
++import android.util.BoostFramework;
+ import android.util.EventLog;
+ import android.util.IntArray;
+ import android.util.Log;
+@@ -155,6 +156,7 @@ import android.view.Display;
+ 
+ import com.android.internal.annotations.GuardedBy;
+ import com.android.internal.annotations.VisibleForTesting;
++import com.android.internal.app.ActivityTrigger;
+ import com.android.internal.app.IVoiceInteractor;
+ import com.android.internal.util.function.pooled.PooledLambda;
+ import com.android.server.Watchdog;
+@@ -177,7 +179,7 @@ import java.util.Set;
+ /**
+  * State and management of a single stack of activities.
+  */
+-class ActivityStack extends ConfigurationContainer {
++public class ActivityStack extends ConfigurationContainer {
+     private static final String TAG = TAG_WITH_CLASS_NAME ? "ActivityStack" : TAG_ATM;
+     private static final String TAG_ADD_REMOVE = TAG + POSTFIX_ADD_REMOVE;
+     private static final String TAG_APP = TAG + POSTFIX_APP;
+@@ -320,6 +322,8 @@ class ActivityStack extends ConfigurationContainer {
+     final ActivityTaskManagerService mService;
+     final WindowManagerService mWindowManager;
+ 
++    public BoostFramework mPerf = null;
++
+     /**
+      * The back history of all previous (and possibly still
+      * running) activities.  It contains #TaskRecord objects.
+@@ -433,8 +437,9 @@ class ActivityStack extends ConfigurationContainer {
+ 
+     final Handler mHandler;
+ 
+-    private class ActivityStackHandler extends Handler {
++    static final ActivityTrigger mActivityTrigger = new ActivityTrigger();
+ 
++    private class ActivityStackHandler extends Handler {
+         ActivityStackHandler(Looper looper) {
+             super(looper);
+         }
+@@ -1062,7 +1067,7 @@ class ActivityStack extends ConfigurationContainer {
+         return super.setBounds(!inMultiWindowMode() ? null : bounds);
+     }
+ 
+-    ActivityRecord topRunningActivityLocked() {
++    public ActivityRecord topRunningActivityLocked() {
+         return topRunningActivityLocked(false /* focusableOnly */);
+     }
+ 
+@@ -1682,6 +1687,11 @@ class ActivityStack extends ConfigurationContainer {
+ 
+         if (DEBUG_STATES) Slog.v(TAG_STATES, "Moving to PAUSING: " + prev);
+         else if (DEBUG_PAUSE) Slog.v(TAG_PAUSE, "Start pausing: " + prev);
++
++        if (mActivityTrigger != null) {
++            mActivityTrigger.activityPauseTrigger(prev.intent, prev.info, prev.appInfo);
++        }
++
+         mPausingActivity = prev;
+         mLastPausedActivity = prev;
+         mLastNoHistoryActivity = (prev.intent.getFlags() & Intent.FLAG_ACTIVITY_NO_HISTORY) != 0
+@@ -2706,9 +2716,15 @@ class ActivityStack extends ConfigurationContainer {
+         mStackSupervisor.mStoppingActivities.remove(next);
+         mStackSupervisor.mGoingToSleepActivities.remove(next);
+         next.sleeping = false;
++        next.launching = true;
+ 
+         if (DEBUG_SWITCH) Slog.v(TAG_SWITCH, "Resuming " + next);
+ 
++        if (mActivityTrigger != null) {
++            mActivityTrigger.activityResumeTrigger(next.intent, next.info, next.appInfo,
++                    next.fullscreen);
++        }
++
+         // If we are currently pausing an activity, then don't do anything until that is done.
+         if (!mRootActivityContainer.allPausedActivitiesComplete()) {
+             if (DEBUG_SWITCH || DEBUG_PAUSE || DEBUG_STATES) Slog.v(TAG_PAUSE,
+@@ -2839,6 +2855,9 @@ class ActivityStack extends ConfigurationContainer {
+                     dc.prepareAppTransition(
+                             prev.getTaskRecord() == next.getTaskRecord() ? TRANSIT_ACTIVITY_CLOSE
+                                     : TRANSIT_TASK_CLOSE, false);
++                    if(prev.getTaskRecord() != next.getTaskRecord() && mPerf != null) {
++                       mPerf.perfHint(BoostFramework.VENDOR_HINT_ANIM_BOOST, next.packageName);
++                    }
+                 }
+                 prev.setVisibility(false);
+             } else {
+@@ -2848,6 +2867,14 @@ class ActivityStack extends ConfigurationContainer {
+                     anim = false;
+                     dc.prepareAppTransition(TRANSIT_NONE, false);
+                 } else {
++                    mWindowManager.prepareAppTransition(prev.getTaskRecord() == next.getTaskRecord()
++                            ? TRANSIT_ACTIVITY_OPEN
++                            : next.mLaunchTaskBehind
++                                    ? TRANSIT_TASK_OPEN_BEHIND
++                                    : TRANSIT_TASK_OPEN, false);
++                    if(prev.getTaskRecord() != next.getTaskRecord() && mPerf != null) {
++                       mPerf.perfHint(BoostFramework.VENDOR_HINT_ANIM_BOOST, next.packageName);
++                    }
+                     dc.prepareAppTransition(
+                             prev.getTaskRecord() == next.getTaskRecord() ? TRANSIT_ACTIVITY_OPEN
+                                     : next.mLaunchTaskBehind ? TRANSIT_TASK_OPEN_BEHIND
+@@ -3206,6 +3233,9 @@ class ActivityStack extends ConfigurationContainer {
+         // is false, because the activity won't be visible.
+         if ((!isHomeOrRecentsStack() || numActivities() > 0) && allowMoveToFront) {
+             final DisplayContent dc = getDisplay().mDisplayContent;
++            if (mPerf == null) {
++                mPerf = new BoostFramework();
++            }
+             if (DEBUG_TRANSITION) Slog.v(TAG_TRANSITION,
+                     "Prepare open transition: starting " + r);
+             if ((r.intent.getFlags() & Intent.FLAG_ACTIVITY_NO_ANIMATION) != 0) {
+@@ -3746,6 +3776,7 @@ class ActivityStack extends ConfigurationContainer {
+ 
+     final void stopActivityLocked(ActivityRecord r) {
+         if (DEBUG_SWITCH) Slog.d(TAG_SWITCH, "Stopping: " + r);
++        r.launching = false;
+         if ((r.intent.getFlags()&Intent.FLAG_ACTIVITY_NO_HISTORY) != 0
+                 || (r.info.flags&ActivityInfo.FLAG_NO_HISTORY) != 0) {
+             if (!r.finishing) {
+@@ -3775,6 +3806,11 @@ class ActivityStack extends ConfigurationContainer {
+                 r.setState(STOPPING, "stopActivityLocked");
+                 if (DEBUG_VISIBILITY) Slog.v(TAG_VISIBILITY,
+                         "Stopping visible=" + r.visible + " for " + r);
++
++                if (mActivityTrigger != null) {
++                    mActivityTrigger.activityStopTrigger(r.intent, r.info, r.appInfo);
++                }
++
+                 if (!r.visible) {
+                     r.setVisible(false);
+                 }
+diff --git a/services/core/java/com/android/server/wm/ActivityStackSupervisor.java b/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+index d403da822fd..c3c8eba0d87 100644
+--- a/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
++++ b/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+@@ -51,6 +51,7 @@ import static android.view.WindowManager.TRANSIT_DOCK_TASK_FROM_RECENTS;
+ 
+ import static com.android.server.wm.ActivityStack.ActivityState.PAUSED;
+ import static com.android.server.wm.ActivityStack.ActivityState.PAUSING;
++import static com.android.server.wm.ActivityStack.ActivityState.DESTROYED;
+ import static com.android.server.wm.ActivityStack.REMOVE_TASK_MODE_MOVING;
+ import static com.android.server.wm.ActivityTaskManagerDebugConfig.DEBUG_ALL;
+ import static com.android.server.wm.ActivityTaskManagerDebugConfig.DEBUG_IDLE;
+@@ -129,6 +130,8 @@ import android.util.MergedConfiguration;
+ import android.util.Slog;
+ import android.util.SparseArray;
+ import android.util.SparseIntArray;
++import android.util.BoostFramework;
++import com.android.internal.app.procstats.ProcessStats;
+ 
+ import com.android.internal.R;
+ import com.android.internal.annotations.GuardedBy;
+@@ -148,6 +151,9 @@ import java.io.PrintWriter;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
++import java.util.Arrays;
++import android.os.AsyncTask;
++
+ // TODO: This class has become a dumping ground. Let's
+ // - Move things relating to the hierarchy to RootWindowContainer
+ // - Move things relating to activity life cycles to maybe a new class called ActivityLifeCycler
+@@ -179,6 +185,13 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+     static final int RESUME_TOP_ACTIVITY_MSG = FIRST_SUPERVISOR_STACK_MSG + 2;
+     static final int SLEEP_TIMEOUT_MSG = FIRST_SUPERVISOR_STACK_MSG + 3;
+     static final int LAUNCH_TIMEOUT_MSG = FIRST_SUPERVISOR_STACK_MSG + 4;
++
++    public static boolean mPerfSendTapHint = false;
++    public static boolean mIsPerfBoostAcquired = false;
++    public static int mPerfHandle = -1;
++    public BoostFramework mPerfBoost = new BoostFramework();
++    public BoostFramework mUxPerf = new BoostFramework();
++
+     static final int LAUNCH_TASK_BEHIND_COMPLETE = FIRST_SUPERVISOR_STACK_MSG + 12;
+     static final int RESTART_ACTIVITY_PROCESS_TIMEOUT_MSG = FIRST_SUPERVISOR_STACK_MSG + 13;
+     static final int REPORT_MULTI_WINDOW_MODE_CHANGED_MSG = FIRST_SUPERVISOR_STACK_MSG + 14;
+@@ -244,7 +257,7 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+     private static final int MAX_TASK_IDS_PER_USER = UserHandle.PER_USER_RANGE;
+ 
+     final ActivityTaskManagerService mService;
+-    RootActivityContainer mRootActivityContainer;
++    public RootActivityContainer mRootActivityContainer;
+ 
+     /** The historial list of recent tasks including inactive tasks */
+     RecentTasks mRecentTasks;
+@@ -622,6 +635,13 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+     void reportActivityLaunchedLocked(boolean timeout, ActivityRecord r, long totalTime,
+             @WaitResult.LaunchState int launchState) {
+         boolean changed = false;
++        if (totalTime > 0) {
++            if (mPerfBoost != null) {
++                if (r.app != null) {
++                    mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_DRAW, r.packageName, r.app.getPid(), BoostFramework.Draw.EVENT_TYPE_V1);
++                }
++            }
++        }
+         for (int i = mWaitingActivityLaunched.size() - 1; i >= 0; i--) {
+             WaitResult w = mWaitingActivityLaunched.remove(i);
+             if (w.who == null) {
+@@ -711,7 +731,7 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+         }
+     }
+ 
+-    ActivityInfo resolveActivity(Intent intent, String resolvedType, int startFlags,
++    public ActivityInfo resolveActivity(Intent intent, String resolvedType, int startFlags,
+             ProfilerInfo profilerInfo, int userId, int filterCallingUid) {
+         final ResolveInfo rInfo = resolveIntent(intent, resolvedType, userId, 0, filterCallingUid);
+         return resolveActivity(intent, rInfo, startFlags, profilerInfo);
+@@ -1393,6 +1413,16 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+     void findTaskToMoveToFront(TaskRecord task, int flags, ActivityOptions options, String reason,
+             boolean forceNonResizeable) {
+         ActivityStack currentStack = task.getStack();
++
++        ActivityStack focusedStack = mRootActivityContainer.getTopDisplayFocusedStack();
++        ActivityRecord top_activity = focusedStack != null ? focusedStack.getTopActivity() : null;
++
++        //top_activity = task.stack.topRunningActivityLocked();
++        /* App is launching from recent apps and it's a new process */
++        if((top_activity != null) && (top_activity.getState() == DESTROYED)) {
++            acquireAppLaunchPerfLock(top_activity);
++        }
++
+         if (currentStack == null) {
+             Slog.e(TAG, "findTaskToMoveToFront: can't move task="
+                     + task + " to front. Stack is null");
+@@ -1883,6 +1913,14 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+                 ActivityManagerInternal::killProcessesForRemovedTask, mService.mAmInternal,
+                 procsToKill);
+         mService.mH.sendMessage(m);
++
++        if(removeFromRecents) {
++            try {
++                new PreferredAppsTask().execute();
++            } catch (Exception e) {
++                Slog.v (TAG, "Exception: " + e);
++            }
++        }
+     }
+ 
+     /**
+@@ -2042,6 +2080,29 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+         return timedout;
+     }
+ 
++    void acquireAppLaunchPerfLock(ActivityRecord r) {
++        /* Acquire perf lock during new app launch */
++        if (mPerfBoost != null) {
++            mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_V1);
++            mPerfSendTapHint = true;
++            mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_V2);
++
++            if(mPerfBoost.perfGetFeedback(BoostFramework.VENDOR_FEEDBACK_WORKLOAD_TYPE, r.packageName) == BoostFramework.WorkloadType.GAME)
++            {
++                mPerfHandle = mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_GAME);
++            } else {
++                mPerfHandle = mPerfBoost.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST, r.packageName, -1, BoostFramework.Launch.BOOST_V3);
++            }
++            if (mPerfHandle > 0)
++                mIsPerfBoostAcquired = true;
++            // Start IOP
++            if (r.appInfo != null && r.appInfo.sourceDir != null) {
++                mPerfBoost.perfIOPrefetchStart(-1,r.packageName,
++                       r.appInfo.sourceDir.substring(0, r.appInfo.sourceDir.lastIndexOf('/')));
++            }
++        }
++    }
++
+     void comeOutOfSleepIfNeededLocked() {
+         removeSleepTimeouts();
+         if (mGoingToSleepWakeLock.isHeld()) {
+@@ -2883,4 +2944,36 @@ public class ActivityStackSupervisor implements RecentTasks.Callbacks {
+             mResult.dump(pw, prefix);
+         }
+     }
++
++    class PreferredAppsTask extends AsyncTask<Void, Void, Void> {
++        @Override
++        protected Void doInBackground(Void... params) {
++            String res = null;
++            final Intent intent = new Intent(Intent.ACTION_MAIN);
++            int trimLevel = 0;
++            try {
++                trimLevel = ActivityManager.getService().getMemoryTrimLevel();
++            } catch (RemoteException e) {
++                return null;
++            }
++            if (mUxPerf != null
++                   && trimLevel < ProcessStats.ADJ_MEM_FACTOR_CRITICAL) {
++                res = mUxPerf.perfUXEngine_trigger(BoostFramework.UXE_TRIGGER);
++                if (res == null)
++                    return null;
++                String[] p_apps = res.split("/");
++                if (p_apps.length != 0) {
++                    ArrayList<String> apps_l = new ArrayList(Arrays.asList(p_apps));
++                    Bundle bParams = new Bundle();
++                    if (bParams == null)
++                        return null;
++                    bParams.putStringArrayList("start_empty_apps", apps_l);
++                    final Message msg = PooledLambda.obtainMessage(
++                                            ActivityManagerInternal::startActivityAsUserEmpty, mService.mAmInternal, bParams);
++                    mService.mH.sendMessage(msg);
++                }
++            }
++            return null;
++        }
++    }
+ }
+diff --git a/services/core/java/com/android/server/wm/ActivityStarter.java b/services/core/java/com/android/server/wm/ActivityStarter.java
+index f37698de34d..3b3de4b003e 100644
+--- a/services/core/java/com/android/server/wm/ActivityStarter.java
++++ b/services/core/java/com/android/server/wm/ActivityStarter.java
+@@ -113,6 +113,7 @@ import android.os.UserHandle;
+ import android.os.UserManager;
+ import android.service.voice.IVoiceInteractionSession;
+ import android.text.TextUtils;
++import android.util.BoostFramework;
+ import android.util.ArraySet;
+ import android.util.EventLog;
+ import android.util.Pools.SynchronizedPool;
+@@ -198,6 +199,8 @@ class ActivityStarter {
+     private IVoiceInteractionSession mVoiceSession;
+     private IVoiceInteractor mVoiceInteractor;
+ 
++    public BoostFramework mPerf = null;
++
+     // Last activity record we attempted to start
+     private final ActivityRecord[] mLastStartActivityRecord = new ActivityRecord[1];
+     // The result of the last activity we attempted to start.
+@@ -445,6 +448,7 @@ class ActivityStarter {
+         mSupervisor = supervisor;
+         mInterceptor = interceptor;
+         reset(true);
++        mPerf = new BoostFramework();
+     }
+ 
+     /**
+@@ -1685,6 +1689,12 @@ class ActivityStarter {
+         if (mStartActivity.resultTo == null && mInTask == null && !mAddingToTask
+                 && (mLaunchFlags & FLAG_ACTIVITY_NEW_TASK) != 0) {
+             newTask = true;
++            String packageName= mService.mContext.getPackageName();
++            if (mPerf != null) {
++                mStartActivity.perfActivityBoostHandler =
++                    mPerf.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST,
++                                        packageName, -1, BoostFramework.Launch.BOOST_V1);
++            }
+             result = setTaskFromReuseOrCreateNewTask(taskToAffiliate);
+         } else if (mSourceRecord != null) {
+             result = setTaskFromSourceRecord();
+@@ -2374,6 +2384,12 @@ class ActivityStarter {
+             Slog.e(TAG, "Attempted Lock Task Mode violation mStartActivity=" + mStartActivity);
+             return START_RETURN_LOCK_TASK_MODE_VIOLATION;
+         }
++        String packageName= mService.mContext.getPackageName();
++        if (mPerf != null) {
++            mStartActivity.perfActivityBoostHandler =
++                mPerf.perfHint(BoostFramework.VENDOR_HINT_FIRST_LAUNCH_BOOST,
++                                    packageName, -1, BoostFramework.Launch.BOOST_V1);
++        }
+ 
+         final TaskRecord sourceTask = mSourceRecord.getTaskRecord();
+         final ActivityStack sourceStack = mSourceRecord.getActivityStack();
+diff --git a/services/core/java/com/android/server/wm/ActivityTaskManagerService.java b/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+index 9f5a8970f4e..00d4fbe1fb7 100644
+--- a/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
++++ b/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+@@ -372,7 +372,7 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
+      * @see WindowManagerThreadPriorityBooster
+      */
+     final Object mGlobalLockWithoutBoost = mGlobalLock;
+-    ActivityStackSupervisor mStackSupervisor;
++    public ActivityStackSupervisor mStackSupervisor;
+     RootActivityContainer mRootActivityContainer;
+     WindowManagerService mWindowManager;
+     private UserManagerService mUserManager;
+diff --git a/services/core/java/com/android/server/wm/DisplayPolicy.java b/services/core/java/com/android/server/wm/DisplayPolicy.java
+index 53de4ac6562..6fd1ac1b752 100644
+--- a/services/core/java/com/android/server/wm/DisplayPolicy.java
++++ b/services/core/java/com/android/server/wm/DisplayPolicy.java
+@@ -18,6 +18,7 @@ package com.android.server.wm;
+ 
+ import static android.app.WindowConfiguration.ACTIVITY_TYPE_HOME;
+ import static android.app.WindowConfiguration.ACTIVITY_TYPE_STANDARD;
++import static android.app.WindowConfiguration.ACTIVITY_TYPE_RECENTS;
+ import static android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM;
+ import static android.app.WindowConfiguration.WINDOWING_MODE_FULLSCREEN;
+ import static android.app.WindowConfiguration.WINDOWING_MODE_SPLIT_SCREEN_PRIMARY;
+@@ -122,6 +123,7 @@ import android.content.Context;
+ import android.content.Intent;
+ import android.content.pm.PackageManager;
+ import android.content.res.Resources;
++import android.content.pm.ApplicationInfo;
+ import android.graphics.Insets;
+ import android.graphics.PixelFormat;
+ import android.graphics.Rect;
+@@ -134,6 +136,8 @@ import android.os.Message;
+ import android.os.SystemClock;
+ import android.os.SystemProperties;
+ import android.os.UserHandle;
++import android.util.BoostFramework;
++import android.provider.Settings;
+ import android.util.ArraySet;
+ import android.util.Pair;
+ import android.util.PrintWriterPrinter;
+@@ -227,6 +231,17 @@ public class DisplayPolicy {
+     private final ImmersiveModeConfirmation mImmersiveModeConfirmation;
+     private final ScreenshotHelper mScreenshotHelper;
+ 
++    private static boolean SCROLL_BOOST_SS_ENABLE = false;
++
++    /*
++     * @hide
++     */
++    BoostFramework mPerfBoostDrag = null;
++    BoostFramework mPerfBoostFling = null;
++    BoostFramework mPerfBoostPrefling = null;
++    BoostFramework mPerf = new BoostFramework();
++    private boolean mIsPerfBoostFlingAcquired;
++
+     private final Object mServiceAcquireLock = new Object();
+     private StatusBarManagerInternal mStatusBarManagerInternal;
+ 
+@@ -427,6 +442,24 @@ public class DisplayPolicy {
+         }
+     }
+ 
++    private boolean isTopAppGame() {
++        boolean isGame = false;
++        try {
++            ActivityManager.RunningTaskInfo rti = ActivityManager.getService().getFilteredTasks(1,
++                                    ACTIVITY_TYPE_RECENTS, WINDOWING_MODE_UNDEFINED).get(0);
++            ApplicationInfo ai = mContext.getPackageManager().getApplicationInfo(
++                        rti.topActivity.getPackageName(), 0);
++            if(ai != null) {
++                isGame = (ai.category == ApplicationInfo.CATEGORY_GAME) ||
++                        ((ai.flags & ApplicationInfo.FLAG_IS_GAME) ==
++                            ApplicationInfo.FLAG_IS_GAME);
++            }
++        } catch (Exception e) {
++            return false;
++        }
++        return isGame;
++    }
++
+     DisplayPolicy(WindowManagerService service, DisplayContent displayContent) {
+         mService = service;
+         mContext = displayContent.isDefaultDisplay ? service.mContext
+@@ -458,6 +491,9 @@ public class DisplayPolicy {
+             mScreenOnFully = true;
+         }
+ 
++        if (mPerf != null)
++                SCROLL_BOOST_SS_ENABLE = Boolean.parseBoolean(mPerf.perfGetProp("vendor.perf.gestureflingboost.enable", "false"));
++
+         final Looper looper = UiThread.getHandler().getLooper();
+         mHandler = new PolicyHandler(looper);
+         mSystemGestures = new SystemGesturesPointerEventListener(mContext, mHandler,
+@@ -516,6 +552,75 @@ public class DisplayPolicy {
+                         }
+                     }
+ 
++                    @Override
++                    public void onVerticalFling(int duration) {
++                        String currentPackage = mContext.getPackageName();
++                        boolean isGame = isTopAppGame();
++                        if (SCROLL_BOOST_SS_ENABLE && !isGame) {
++                            if (mPerfBoostFling == null) {
++                                mPerfBoostFling = new BoostFramework();
++                                mIsPerfBoostFlingAcquired = false;
++                            }
++                            if (mPerfBoostFling == null) {
++                                Slog.e(TAG, "Error: boost object null");
++                                return;
++                            }
++
++                            mPerfBoostFling.perfHint(BoostFramework.VENDOR_HINT_SCROLL_BOOST,
++                                currentPackage, duration + 160, BoostFramework.Scroll.VERTICAL);
++                            mIsPerfBoostFlingAcquired = true;
++                        }
++                    }
++
++                    @Override
++                    public void onHorizontalFling(int duration) {
++                        String currentPackage = mContext.getPackageName();
++                        boolean isGame = isTopAppGame();
++                        if (SCROLL_BOOST_SS_ENABLE && !isGame) {
++                            if (mPerfBoostFling == null) {
++                                mPerfBoostFling = new BoostFramework();
++                                mIsPerfBoostFlingAcquired = false;
++                            }
++                            if (mPerfBoostFling == null) {
++                                Slog.e(TAG, "Error: boost object null");
++                                return;
++                            }
++                            mPerfBoostFling.perfHint(BoostFramework.VENDOR_HINT_SCROLL_BOOST,
++                                currentPackage, duration + 160, BoostFramework.Scroll.HORIZONTAL);
++                            mIsPerfBoostFlingAcquired = true;
++                        }
++                    }
++
++                    @Override
++                    public void onScroll(boolean started) {
++                        String currentPackage = mContext.getPackageName();
++                        boolean isGame = isTopAppGame();
++                        if (mPerfBoostDrag == null) {
++                            mPerfBoostDrag = new BoostFramework();
++                        }
++                        if (mPerfBoostDrag == null) {
++                            Slog.e(TAG, "Error: boost object null");
++                            return;
++                        }
++                        if (SCROLL_BOOST_SS_ENABLE && !isGame) {
++                            if (mPerfBoostPrefling == null) {
++                                mPerfBoostPrefling = new BoostFramework();
++                            }
++                            if (mPerfBoostPrefling == null) {
++                                Slog.e(TAG, "Error: boost object null");
++                                return;
++                            }
++                            mPerfBoostPrefling.perfHint(BoostFramework.VENDOR_HINT_SCROLL_BOOST,
++                                    currentPackage, -1, BoostFramework.Scroll.PREFILING);
++                        }
++                        if (!isGame && started) {
++                            mPerfBoostDrag.perfHint(BoostFramework.VENDOR_HINT_DRAG_BOOST,
++                                            currentPackage, -1, 1);
++                        } else {
++                            mPerfBoostDrag.perfLockRelease();
++                        }
++                    }
++
+                     @Override
+                     public void onDebug() {
+                         // no-op
+@@ -532,6 +637,11 @@ public class DisplayPolicy {
+                         if (listener != null) {
+                             listener.onTouchStart();
+                         }
++                        if(SCROLL_BOOST_SS_ENABLE && mPerfBoostFling!= null
++                                            && mIsPerfBoostFlingAcquired) {
++                            mPerfBoostFling.perfLockRelease();
++                            mIsPerfBoostFlingAcquired = false;
++                        }
+                     }
+ 
+                     @Override
+diff --git a/services/core/java/com/android/server/wm/RecentTasks.java b/services/core/java/com/android/server/wm/RecentTasks.java
+index 541a8bbc886..9b2bd019a42 100644
+--- a/services/core/java/com/android/server/wm/RecentTasks.java
++++ b/services/core/java/com/android/server/wm/RecentTasks.java
+@@ -67,6 +67,7 @@ import android.util.ArraySet;
+ import android.util.Slog;
+ import android.util.SparseArray;
+ import android.util.SparseBooleanArray;
++import android.util.BoostFramework;
+ import android.view.MotionEvent;
+ import android.view.WindowManagerPolicyConstants.PointerEventListener;
+ 
+@@ -191,6 +192,7 @@ class RecentTasks {
+     private final HashMap<ComponentName, ActivityInfo> mTmpAvailActCache = new HashMap<>();
+     private final HashMap<String, ApplicationInfo> mTmpAvailAppCache = new HashMap<>();
+     private final SparseBooleanArray mTmpQuietProfileUserIds = new SparseBooleanArray();
++    private final BoostFramework mUxPerf = new BoostFramework();
+ 
+     // TODO(b/127498985): This is currently a rough heuristic for interaction inside an app
+     private final PointerEventListener mListener = new PointerEventListener() {
+@@ -1160,6 +1162,13 @@ class RecentTasks {
+     void remove(TaskRecord task) {
+         mTasks.remove(task);
+         notifyTaskRemoved(task, false /* wasTrimmed */, false /* killProcess */);
++        if (task != null) {
++            final String taskPkgName =
++                  task.getBaseIntent().getComponent().getPackageName();
++            if (mUxPerf != null) {
++                mUxPerf.perfUXEngine_events(BoostFramework.UXE_EVENT_KILL, 0, taskPkgName, 0);
++            }
++        }
+     }
+ 
+     /**
+diff --git a/services/core/java/com/android/server/wm/RootActivityContainer.java b/services/core/java/com/android/server/wm/RootActivityContainer.java
+index ffbf68813d3..602e986e98d 100644
+--- a/services/core/java/com/android/server/wm/RootActivityContainer.java
++++ b/services/core/java/com/android/server/wm/RootActivityContainer.java
+@@ -132,7 +132,7 @@ import java.util.Set;
+  * TODO: This class is mostly temporary to separate things out of ActivityStackSupervisor.java. The
+  * intention is to have this merged with RootWindowContainer.java as part of unifying the hierarchy.
+  */
+-class RootActivityContainer extends ConfigurationContainer
++public class RootActivityContainer extends ConfigurationContainer
+         implements DisplayManager.DisplayListener {
+ 
+     private static final String TAG = TAG_WITH_CLASS_NAME ? "RootActivityContainer" : TAG_ATM;
+@@ -690,7 +690,7 @@ class RootActivityContainer extends ConfigurationContainer
+         return topActivityTokens;
+     }
+ 
+-    ActivityStack getTopDisplayFocusedStack() {
++    public ActivityStack getTopDisplayFocusedStack() {
+         for (int i = mActivityDisplays.size() - 1; i >= 0; --i) {
+             final ActivityStack focusedStack = mActivityDisplays.get(i).getFocusedStack();
+             if (focusedStack != null) {
+diff --git a/services/core/java/com/android/server/wm/ScreenRotationAnimation.java b/services/core/java/com/android/server/wm/ScreenRotationAnimation.java
+index b94a7dc781e..13e92b43168 100644
+--- a/services/core/java/com/android/server/wm/ScreenRotationAnimation.java
++++ b/services/core/java/com/android/server/wm/ScreenRotationAnimation.java
+@@ -28,6 +28,7 @@ import static com.android.server.wm.WindowStateAnimator.WINDOW_FREEZE_LAYER;
+ import android.content.Context;
+ import android.graphics.Matrix;
+ import android.graphics.Rect;
++import android.util.BoostFramework;
+ import android.util.Slog;
+ import android.util.proto.ProtoOutputStream;
+ import android.view.Display;
+@@ -58,6 +59,8 @@ class ScreenRotationAnimation {
+     static final int SCREEN_FREEZE_LAYER_EXIT       = SCREEN_FREEZE_LAYER_BASE + 2;
+     static final int SCREEN_FREEZE_LAYER_CUSTOM     = SCREEN_FREEZE_LAYER_BASE + 3;
+ 
++    private BoostFramework mPerf = null;
++    private boolean mIsPerfLockAcquired = false;
+     final Context mContext;
+     final DisplayContent mDisplayContent;
+     SurfaceControl mSurfaceControl;
+@@ -228,6 +231,8 @@ class ScreenRotationAnimation {
+         mDisplayContent = displayContent;
+         displayContent.getBounds(mOriginalDisplayRect);
+ 
++        mPerf = new BoostFramework();
++
+         // Screenshot does NOT include rotation!
+         final Display display = displayContent.getDisplay();
+         int originalRotation = display.getRotation();
+@@ -695,6 +700,10 @@ class ScreenRotationAnimation {
+             mRotateEnterAnimation.cancel();
+             mRotateEnterAnimation = null;
+         }
++        if (mPerf != null && mIsPerfLockAcquired) {
++            mPerf.perfLockRelease();
++            mIsPerfLockAcquired = false;
++        }
+     }
+ 
+     public boolean isAnimating() {
+@@ -983,6 +992,10 @@ class ScreenRotationAnimation {
+             }
+             mAnimRunning = true;
+             mHalfwayPoint = now + mRotateEnterAnimation.getDuration() / 2;
++            if (mPerf != null && !mIsPerfLockAcquired) {
++                mPerf.perfHint(BoostFramework.VENDOR_HINT_ROTATION_ANIM_BOOST, null);
++                mIsPerfLockAcquired = true;
++            }
+         }
+ 
+         return stepAnimation(now);
+diff --git a/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java b/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java
+index fb781b06f05..6850bbcf14e 100644
+--- a/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java
++++ b/services/core/java/com/android/server/wm/SystemGesturesPointerEventListener.java
+@@ -69,6 +69,7 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+     private boolean mDebugFireable;
+     private boolean mMouseHoveringAtEdge;
+     private long mLastFlingTime;
++    private boolean mScrollFired;
+ 
+     SystemGesturesPointerEventListener(Context context, Handler handler, Callbacks callbacks) {
+         mContext = checkNull("context", context);
+@@ -130,6 +131,7 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             case MotionEvent.ACTION_DOWN:
+                 mSwipeFireable = true;
+                 mDebugFireable = true;
++                mScrollFired = false;
+                 mDownPointers = 0;
+                 captureDown(event, 0);
+                 if (mMouseHoveringAtEdge) {
+@@ -186,6 +188,9 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             case MotionEvent.ACTION_CANCEL:
+                 mSwipeFireable = false;
+                 mDebugFireable = false;
++                if (mScrollFired)
++                    mCallbacks.onScroll(false);
++                mScrollFired = false;
+                 mCallbacks.onUpOrCancel();
+                 break;
+             default:
+@@ -308,10 +313,24 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+             if (duration > MAX_FLING_TIME_MILLIS) {
+                 duration = MAX_FLING_TIME_MILLIS;
+             }
++            if(Math.abs(velocityY) >= Math.abs(velocityX))
++                mCallbacks.onVerticalFling(duration);
++            else
++                mCallbacks.onHorizontalFling(duration);
+             mLastFlingTime = now;
+             mCallbacks.onFling(duration);
+             return true;
+         }
++
++        @Override
++        public boolean onScroll(MotionEvent e1, MotionEvent e2,
++                                   float distanceX, float distanceY) {
++           if (!mScrollFired) {
++               mCallbacks.onScroll(true);
++               mScrollFired = true;
++           }
++           return true;
++        }
+     }
+ 
+     interface Callbacks {
+@@ -320,6 +339,9 @@ class SystemGesturesPointerEventListener implements PointerEventListener {
+         void onSwipeFromRight();
+         void onSwipeFromLeft();
+         void onFling(int durationMs);
++        void onVerticalFling(int durationMs);
++        void onHorizontalFling(int durationMs);
++        void onScroll(boolean started);
+         void onDown();
+         void onUpOrCancel();
+         void onMouseHoverAtTop();
+diff --git a/services/core/java/com/android/server/wm/TaskTapPointerEventListener.java b/services/core/java/com/android/server/wm/TaskTapPointerEventListener.java
+index 79baab6bfbb..b04b26feb14 100644
+--- a/services/core/java/com/android/server/wm/TaskTapPointerEventListener.java
++++ b/services/core/java/com/android/server/wm/TaskTapPointerEventListener.java
+@@ -29,6 +29,10 @@ import android.view.MotionEvent;
+ import android.view.WindowManagerPolicyConstants.PointerEventListener;
+ 
+ import com.android.server.wm.WindowManagerService.H;
++import com.android.server.am.ActivityManagerService;
++import com.android.server.wm.ActivityStackSupervisor;
++import com.android.server.wm.ActivityDisplay;
++import android.util.BoostFramework;
+ 
+ /**
+  * 1. Adjust the top most focus display if touch down on some display.
+@@ -41,6 +45,7 @@ public class TaskTapPointerEventListener implements PointerEventListener {
+     private final DisplayContent mDisplayContent;
+     private final Rect mTmpRect = new Rect();
+     private int mPointerIconType = TYPE_NOT_SPECIFIED;
++    public BoostFramework mPerfObj = null;
+ 
+     public TaskTapPointerEventListener(WindowManagerService service,
+             DisplayContent displayContent) {
+@@ -113,6 +118,28 @@ public class TaskTapPointerEventListener implements PointerEventListener {
+             }
+             break;
+         }
++        if (ActivityStackSupervisor.mIsPerfBoostAcquired && (mPerfObj != null)) {
++            if (ActivityStackSupervisor.mPerfHandle > 0) {
++                mPerfObj.perfLockReleaseHandler(ActivityStackSupervisor.mPerfHandle);
++                ActivityStackSupervisor.mPerfHandle = -1;
++            }
++            ActivityStackSupervisor.mIsPerfBoostAcquired = false;
++        }
++        if (ActivityStackSupervisor.mPerfSendTapHint && (mPerfObj != null)) {
++            mPerfObj.perfHint(BoostFramework.VENDOR_HINT_TAP_EVENT, null);
++            ActivityStackSupervisor.mPerfSendTapHint = false;
++        }
++        if (ActivityDisplay.mIsPerfBoostAcquired && (mPerfObj != null)) {
++            if (ActivityDisplay.mPerfHandle > 0) {
++                mPerfObj.perfLockReleaseHandler(ActivityDisplay.mPerfHandle);
++                ActivityDisplay.mPerfHandle = -1;
++            }
++            ActivityDisplay.mIsPerfBoostAcquired = false;
++        }
++        if (ActivityDisplay.mPerfSendTapHint && (mPerfObj != null)) {
++            mPerfObj.perfHint(BoostFramework.VENDOR_HINT_TAP_EVENT, null);
++            ActivityDisplay.mPerfSendTapHint = false;
++        }
+     }
+ 
+     void setTouchExcludeRegion(Region newRegion) {
+diff --git a/services/core/java/com/android/server/wm/WindowManagerService.java b/services/core/java/com/android/server/wm/WindowManagerService.java
+index fd6fb810772..9c76dc2e360 100644
+--- a/services/core/java/com/android/server/wm/WindowManagerService.java
++++ b/services/core/java/com/android/server/wm/WindowManagerService.java
+@@ -187,6 +187,7 @@ import android.service.vr.IVrStateCallbacks;
+ import android.text.format.DateUtils;
+ import android.util.ArrayMap;
+ import android.util.ArraySet;
++import android.util.BoostFramework;
+ import android.util.DisplayMetrics;
+ import android.util.EventLog;
+ import android.util.Log;
+@@ -294,6 +295,9 @@ public class WindowManagerService extends IWindowManager.Stub
+     static final boolean PROFILE_ORIENTATION = false;
+     static final boolean localLOGV = DEBUG;
+ 
++    static WindowState mFocusingWindow;
++    String mFocusingActivity;
++
+     /** How much to multiply the policy's type layer, to reserve room
+      * for multiple windows of the same type and Z-ordering adjustment
+      * with TYPE_LAYER_OFFSET. */
+@@ -390,6 +394,8 @@ public class WindowManagerService extends IWindowManager.Stub
+ 
+     final WindowTracing mWindowTracing;
+ 
++    private BoostFramework mPerf = null;
++
+     final private KeyguardDisableHandler mKeyguardDisableHandler;
+     // TODO: eventually unify all keyguard state in a common place instead of having it spread over
+     // AM's KeyguardController and the policy's KeyguardServiceDelegate.
+@@ -3047,12 +3053,28 @@ public class WindowManagerService extends IWindowManager.Stub
+         ValueAnimator.setDurationScale(scale);
+     }
+ 
++    private float animationScalesCheck (int which) {
++        float value = -1.0f;
++        if (!mAnimationsDisabled) {
++            if (value == -1.0f) {
++                switch (which) {
++                    case WINDOW_ANIMATION_SCALE: value = mWindowAnimationScaleSetting; break;
++                    case TRANSITION_ANIMATION_SCALE: value = mTransitionAnimationScaleSetting; break;
++                    case ANIMATION_DURATION_SCALE: value = mAnimatorDurationScaleSetting; break;
++                }
++            }
++        } else {
++            value = 0;
++        }
++        return value;
++    }
++
+     public float getWindowAnimationScaleLocked() {
+-        return mAnimationsDisabled ? 0 : mWindowAnimationScaleSetting;
++        return mAnimationsDisabled ? 0 : animationScalesCheck(WINDOW_ANIMATION_SCALE);
+     }
+ 
+     public float getTransitionAnimationScaleLocked() {
+-        return mAnimationsDisabled ? 0 : mTransitionAnimationScaleSetting;
++        return mAnimationsDisabled ? 0 : animationScalesCheck(TRANSITION_ANIMATION_SCALE);
+     }
+ 
+     @Override
+-- 
+2.28.0
+
