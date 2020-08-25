@@ -1,7 +1,7 @@
-From 0c58d6bc73494697a66808c966c0ac12875f66a7 Mon Sep 17 00:00:00 2001
+From 6d469495cdf82f057585685db48dde45b5fbe116 Mon Sep 17 00:00:00 2001
 From: jhenrique09 <jhenrique09.mcz@hotmail.com>
 Date: Thu, 26 Mar 2020 04:56:47 -0300
-Subject: [PATCH] [4/4] Port face unlock feature
+Subject: [PATCH] Port face unlock feature
 
 * From motorola/foles_retail/foles:10/QPF30.130-15-7/38ece7:user/release-keys
 
@@ -59,6 +59,7 @@ Signed-off-by: DennySPB <dennyspb@gmail.com>
  res/values-zh-rSG/moto_strings.xml            |  5 ++
  res/values-zh-rTW/moto_strings.xml            |  5 ++
  res/values/moto_strings.xml                   |  5 ++
+ res/values/strings.xml                        |  3 +
  res/xml/security_settings_face.xml            |  3 +-
  src/com/android/settings/Utils.java           | 15 +++++
  .../BiometricEnrollIntroduction.java          |  2 +-
@@ -73,7 +74,7 @@ Signed-off-by: DennySPB <dennyspb@gmail.com>
  .../face/FaceStatusPreferenceController.java  | 65 +++++++++++++++++--
  .../settings/password/ChooseLockGeneric.java  | 18 +++--
  .../settings/security/SecuritySettings.java   |  2 +-
- 65 files changed, 464 insertions(+), 15 deletions(-)
+ 66 files changed, 467 insertions(+), 15 deletions(-)
  create mode 100644 res/values-ar-rSA/moto_strings.xml
  create mode 100644 res/values-az-rAZ/moto_strings.xml
  create mode 100644 res/values-bg-rBG/moto_strings.xml
@@ -127,10 +128,10 @@ Signed-off-by: DennySPB <dennyspb@gmail.com>
  create mode 100644 src/com/android/settings/biometrics/face/FaceSettingsManagePreferenceController.java
 
 diff --git a/Android.mk b/Android.mk
-index 75fd5a2e54..130ea3b93e 100644
+index d1c305e84e..c66154a331 100644
 --- a/Android.mk
 +++ b/Android.mk
-@@ -52,7 +52,8 @@ LOCAL_STATIC_JAVA_LIBRARIES := \
+@@ -51,7 +51,8 @@ LOCAL_STATIC_JAVA_LIBRARIES := \
      settings-log-bridge-protos-lite \
      contextualcards \
      settings-logtags \
@@ -138,8 +139,8 @@ index 75fd5a2e54..130ea3b93e 100644
 +    zxing-core-1.7 \
 +    faceunlock_utils
  
- LOCAL_RESOURCE_DIR := $(LOCAL_PATH)/res \
-     packages/apps/RevengeSettings/res
+ LOCAL_PROGUARD_FLAG_FILES := proguard.flags
+ 
 diff --git a/res/values-ar-rSA/moto_strings.xml b/res/values-ar-rSA/moto_strings.xml
 new file mode 100644
 index 0000000000..be6b0650f2
@@ -691,6 +692,20 @@ index 0000000000..7435204c92
 +    <string name="security_settings_face_settings_remove_dialog_details_moto">Data recorded by face unlock will be permanently and securely deleted. After removal, you will need your PIN, pattern, or password to unlock your phone.</string>
 +</resources>
 \ No newline at end of file
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index e1486ee865..fa6013bceb 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -11423,6 +11423,9 @@
+     <string name="work_policy_privacy_settings">Your work policy info</string>
+     <!-- Summary for Enterprise Privacy settings, explaining what the user can expect to find under it [CHAR LIMIT=NONE]-->
+     <string name="work_policy_privacy_settings_summary">Settings managed by your IT admin</string>
++    <!-- Moto Face Unlock -->
++    <string name="security_settings_face_settings_footer_moto">Use Face unlock to unlock your device.\n\nKeep in mind:\nLooking at the phone can unlock it when you don’t intend to.\n\nYour phone can be unlocked by someone else if it’s held up to your face while your eyes are open.\n\nYour phone can be unlocked by someone who looks a lot like you, say, your child or an identical sibling.</string>
++    <string name="security_settings_face_settings_remove_dialog_details_moto">Data recorded by face unlock will be permanently and securely deleted. After removal, you will need your PIN, pattern, or password to unlock your phone.</string>
+     <!-- Title for RTT setting. [CHAR LIMIT=NONE] -->
+     <string name="rtt_settings_title"></string>
+     <!-- Subtext for showing the option of RTT setting. [CHAR LIMIT=NONE] -->
 diff --git a/res/xml/security_settings_face.xml b/res/xml/security_settings_face.xml
 index e613470057..e9b6834a83 100644
 --- a/res/xml/security_settings_face.xml
@@ -706,12 +721,12 @@ index e613470057..e9b6834a83 100644
              android:key="security_settings_face_require_attention"
              android:title="@string/security_settings_face_settings_require_attention"
 diff --git a/src/com/android/settings/Utils.java b/src/com/android/settings/Utils.java
-index 75db3e1818..48c05e8b53 100644
+index 4db359c72b..d4c9ae217a 100644
 --- a/src/com/android/settings/Utils.java
 +++ b/src/com/android/settings/Utils.java
-@@ -1065,4 +1065,19 @@ public final class Utils extends com.android.settingslib.Utils {
-             ActionBarShadowController.attachToView(activity, lifecycle, scrollView);
+@@ -1072,4 +1072,19 @@ public final class Utils extends com.android.settingslib.Utils {
          }
+         return input;
      }
 +
 +    public static boolean isFaceDisabledByAdmin(Context context) {
@@ -1106,7 +1121,7 @@ index cb82b5e856..380493a012 100644
 +
  }
 diff --git a/src/com/android/settings/password/ChooseLockGeneric.java b/src/com/android/settings/password/ChooseLockGeneric.java
-index 2a7de05719..6d4ed15991 100644
+index dc74b9db9d..022a886f7a 100644
 --- a/src/com/android/settings/password/ChooseLockGeneric.java
 +++ b/src/com/android/settings/password/ChooseLockGeneric.java
 @@ -79,6 +79,8 @@ import com.android.settingslib.widget.FooterPreferenceMixinCompat;
